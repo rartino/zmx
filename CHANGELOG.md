@@ -4,6 +4,24 @@ Use spec: https://common-changelog.org/
 
 ## Staged
 
+### Added
+
+- Opt-in `--log-input` policy for `attach`, `run`, `send`, and `write`; PTY input is no longer logged by default.
+
+### Security
+
+- Keyboard classification no longer passes input bytes through Ghostty.
+- Session switching validates canonical targets at both ends and discards terminal typeahead at the transition barrier.
+- Runtime/log directories now require owner-only `0700`; logs and sockets require owner-only `0600`, with ownership, type, and symlink checks that fail closed.
+- IPC frames and per-client output queues are bounded so a malformed or stalled peer is disconnected without terminating its session daemon.
+
+### Changed
+
+- `ZMX_DIR_MODE` and `ZMX_LOG_MODE` are no longer supported. Unset them before upgrading.
+- Input-logging policy is immutable for a live session. Use `--log-input` on every input-capable connection to acknowledge a logging-enabled session.
+- The internal session name `logs` is reserved. `zmx write` accepts at most 128 KiB per request, queues the PTY transaction atomically, and acknowledges it only after remote size verification.
+- Existing logs are not deleted automatically and may contain historical raw input from older versions.
+
 ## v0.7.0 - 2026-07-23
 
 ### Added

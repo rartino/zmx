@@ -1,5 +1,12 @@
 const std = @import("std");
 const lib_posix = @import("posix.zig");
+const c = @cImport({
+    @cInclude("fcntl.h");
+    @cInclude("sys/stat.h");
+    @cInclude("unistd.h");
+});
+
+const socket_mode_bits: std.posix.mode_t = 0o600;
 
 pub fn getSeshPrefix() []const u8 {
     return lib_posix.getenv("ZMX_SESSION_PREFIX") orelse "";
@@ -20,7 +27,8 @@ pub fn getSeshName(alloc: std.mem.Allocator, sesh: []const u8) ![]const u8 {
     // deletion from operating outside that directory.
     if (std.mem.indexOfScalar(u8, full, '/') != null or
         std.mem.indexOfScalar(u8, full, 0) != null or
-        std.mem.eql(u8, full, ".") or std.mem.eql(u8, full, ".."))
+        std.mem.eql(u8, full, ".") or std.mem.eql(u8, full, "..") or
+        std.mem.eql(u8, full, "logs"))
     {
         alloc.free(full);
         return error.InvalidSessionName;
@@ -67,6 +75,15 @@ pub fn parseSessionArg(alloc: std.mem.Allocator, raw: []const u8) !SessionMatch 
 }
 
 pub fn sessionConnect(sesh: []const u8) !i32 {
+    const stat = statPath(sesh) catch |err| {
+        if (err != error.FileNotFound) reportInsecureSocket(sesh, err);
+        return err;
+    };
+    validateSocketMetadata(stat, c.geteuid()) catch |err| {
+        reportInsecureSocket(sesh, err);
+        return error.InsecureSocket;
+    };
+
     var unix_addr = try lib_posix.initUnix(sesh);
     const socket_fd = try lib_posix.socket(lib_posix.AF.UNIX, lib_posix.SOCK.STREAM | lib_posix.SOCK.CLOEXEC, 0);
     errdefer lib_posix.close(socket_fd);
@@ -74,23 +91,37 @@ pub fn sessionConnect(sesh: []const u8) !i32 {
     return socket_fd;
 }
 
-pub fn cleanupStaleSocket(io: std.Io, dir: std.Io.Dir, session_name: []const u8) void {
+pub fn cleanupStaleSocket(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, session_name: []const u8) void {
+    const stat = statAt(dir, session_name) catch |err| {
+        if (err != error.FileNotFound) {
+            std.log.warn("refusing stale socket cleanup session={s} err={s}", .{ session_name, @errorName(err) });
+        }
+        return;
+    };
+    validateSocketMetadata(stat, c.geteuid()) catch |err| {
+        reportInsecureSocketEntry(dir_path, session_name, err);
+        return;
+    };
+
     std.log.warn("stale socket found, cleaning up session={s}", .{session_name});
     dir.deleteFile(io, session_name) catch |err| {
         std.log.warn("failed to delete stale socket err={s}", .{@errorName(err)});
     };
 }
 
-pub fn sessionExists(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
-    const stat = dir.statFile(io, name, std.Io.Dir.StatFileOptions{}) catch |err| {
+pub fn sessionExists(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, name: []const u8) !bool {
+    _ = dir.statFile(io, name, .{ .follow_symlinks = false }) catch |err| {
         switch (err) {
             error.FileNotFound => return false,
             else => return err,
         }
     };
-    if (stat.kind != .unix_domain_socket) {
-        return error.FileNotUnixSocket;
-    }
+
+    const stat = try statAt(dir, name);
+    validateSocketMetadata(stat, c.geteuid()) catch |err| {
+        reportInsecureSocketEntry(dir_path, name, err);
+        return error.InsecureSocket;
+    };
     return true;
 }
 
@@ -104,11 +135,76 @@ pub fn createSocket(sesh: []const u8) !lib_posix.socket_t {
         0,
     );
     errdefer lib_posix.close(fd);
+    var path_buf = try pathZ(sesh);
+    var bound = false;
+    errdefer {
+        if (bound) _ = c.unlink(path_buf[0..sesh.len :0]);
+    }
 
     var unix_addr = try lib_posix.initUnix(sesh);
     try lib_posix.bind(fd, &unix_addr.any, unix_addr.getOsSockLen());
+    bound = true;
+
+    if (c.chmod(path_buf[0..sesh.len :0], @intCast(socket_mode_bits)) != 0) {
+        return error.SocketModeSetFailed;
+    }
+    const stat = statPath(sesh) catch |err| {
+        reportInsecureSocket(sesh, err);
+        return error.InsecureSocket;
+    };
+    validateSocketMetadata(stat, c.geteuid()) catch |err| {
+        reportInsecureSocket(sesh, err);
+        return error.InsecureSocket;
+    };
     try lib_posix.listen(fd, 128);
+
+    // The errdefer above owns the newly-bound path until listen succeeds.
+    bound = false;
     return fd;
+}
+
+fn pathZ(path: []const u8) ![std.c.PATH_MAX + 1]u8 {
+    var path_buf: [std.c.PATH_MAX + 1]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    return path_buf;
+}
+
+fn statPath(path: []const u8) !c.struct_stat {
+    var path_buf = try pathZ(path);
+    var stat: c.struct_stat = undefined;
+    const rc = c.fstatat(c.AT_FDCWD, path_buf[0..path.len :0], &stat, c.AT_SYMLINK_NOFOLLOW);
+    if (rc == 0) return stat;
+    return if (std.c.errno(rc) == .NOENT) error.FileNotFound else error.MetadataUnavailable;
+}
+
+fn statAt(dir: std.Io.Dir, name: []const u8) !c.struct_stat {
+    var path_buf = try pathZ(name);
+    var stat: c.struct_stat = undefined;
+    const rc = c.fstatat(dir.handle, path_buf[0..name.len :0], &stat, c.AT_SYMLINK_NOFOLLOW);
+    if (rc == 0) return stat;
+    return if (std.c.errno(rc) == .NOENT) error.FileNotFound else error.MetadataUnavailable;
+}
+
+fn validateSocketMetadata(stat: c.struct_stat, expected_uid: c.uid_t) !void {
+    if (!c.S_ISSOCK(stat.st_mode)) return error.NotUnixSocket;
+    if (stat.st_uid != expected_uid) return error.WrongOwner;
+    if (stat.st_mode & 0o7777 != socket_mode_bits) return error.WrongMode;
+}
+
+fn reportInsecureSocket(path: []const u8, err: anyerror) void {
+    std.debug.print(
+        "error: insecure zmx socket \"{s}\" ({s}); remove a symlink/wrong-type path, or run: chmod 600 \"{s}\" && chown {d} \"{s}\"\n",
+        .{ path, @errorName(err), path, c.geteuid(), path },
+    );
+}
+
+fn reportInsecureSocketEntry(dir_path: []const u8, name: []const u8, err: anyerror) void {
+    std.debug.print(
+        "error: insecure zmx socket \"{s}/{s}\" ({s}); remove a symlink/wrong-type path, or run: chmod 600 \"{s}/{s}\" && chown {d} \"{s}/{s}\"\n",
+        .{ dir_path, name, @errorName(err), dir_path, name, c.geteuid(), dir_path, name },
+    );
 }
 
 /// Maximum number of usable bytes in a Unix domain socket path.
@@ -131,6 +227,23 @@ pub fn getSocketPath(
     @memcpy(fname[dir.len .. dir.len + 1], "/");
     @memcpy(fname[dir.len + 1 ..], session_name);
     return fname;
+}
+
+/// Validate a session name at the point where a peer asks to switch to it.
+/// Keep this check allocation-free and consistent with getSeshName so a
+/// caller cannot make the daemon address a path outside socket_dir.
+pub fn validateCanonicalSessionName(socket_dir: []const u8, session_name: []const u8) !void {
+    if (session_name.len == 0 or
+        std.mem.indexOfScalar(u8, session_name, '/') != null or
+        std.mem.indexOfScalar(u8, session_name, 0) != null or
+        std.mem.eql(u8, session_name, ".") or
+        std.mem.eql(u8, session_name, "..") or
+        std.mem.eql(u8, session_name, "logs"))
+    {
+        return error.InvalidSessionName;
+    }
+    const max_len = maxSessionNameLen(socket_dir) orelse return error.NameTooLong;
+    if (session_name.len > max_len) return error.NameTooLong;
 }
 
 pub fn printSessionNameTooLong(io: std.Io, session_name: []const u8, socket_dir: []const u8) void {
@@ -165,6 +278,34 @@ test "max_socket_path_len matches platform sockaddr_un" {
     ).array.len;
     try std.testing.expectEqual(path_field_len - 1, max_socket_path_len);
     try std.testing.expect(max_socket_path_len > 0);
+}
+
+test "canonical session validation rejects malicious and overlong switch targets" {
+    try validateCanonicalSessionName("/tmp/zmx", "dev.nested");
+    inline for (&.{ "", ".", "..", "logs", "a/b", "a\x00b" }) |name| {
+        try std.testing.expectError(error.InvalidSessionName, validateCanonicalSessionName("/tmp/zmx", name));
+    }
+
+    const max_len = maxSessionNameLen("/tmp/zmx").?;
+    const overlong = try std.testing.allocator.alloc(u8, max_len + 1);
+    defer std.testing.allocator.free(overlong);
+    @memset(overlong, 'x');
+    try std.testing.expectError(error.NameTooLong, validateCanonicalSessionName("/tmp/zmx", overlong));
+}
+
+test "socket metadata validation rejects foreign, wrong-mode, and wrong-type metadata" {
+    var stat = std.mem.zeroes(c.struct_stat);
+    stat.st_uid = c.geteuid();
+    stat.st_mode = c.S_IFSOCK | 0o600;
+    try validateSocketMetadata(stat, c.geteuid());
+
+    stat.st_uid = c.geteuid() + 1;
+    try std.testing.expectError(error.WrongOwner, validateSocketMetadata(stat, c.geteuid()));
+    stat.st_uid = c.geteuid();
+    stat.st_mode = c.S_IFSOCK | 0o666;
+    try std.testing.expectError(error.WrongMode, validateSocketMetadata(stat, c.geteuid()));
+    stat.st_mode = c.S_IFREG | 0o600;
+    try std.testing.expectError(error.NotUnixSocket, validateSocketMetadata(stat, c.geteuid()));
 }
 
 test "getSocketPath succeeds for paths within limit" {

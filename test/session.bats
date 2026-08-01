@@ -222,6 +222,7 @@ load test_helper
   # A different ZMX_DIR should see no sessions
   local other_dir="$BATS_TEST_TMPDIR/zmx-other"
   mkdir -p "$other_dir"
+  chmod 700 "$other_dir"
   run env ZMX_DIR="$other_dir" "$ZMX" list --short
   [ "$status" -eq 0 ]
   [ -z "$output" ]

@@ -1,6 +1,7 @@
 const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
+const input = @import("input.zig");
 const log = @import("log.zig");
 const util = @import("util.zig");
 const cross = @import("cross.zig");
@@ -13,21 +14,48 @@ const assert = std.debug.assert;
 const daemonize = @import("daemonize.zig");
 const builtin = @import("builtin");
 
+const WRITE_MARKER_PREFIX = "\x1bPzmxw:";
+const WRITE_MARKER_SUFFIX = "\x1b\\";
+
+fn appendShellWriteMarker(
+    gpa: std.mem.Allocator,
+    command: *std.ArrayList(u8),
+    token: []const u8,
+    kind: u8,
+) !void {
+    try command.appendSlice(gpa, "printf '\\033Pzmxw:");
+    try command.appendSlice(gpa, token);
+    try command.appendSlice(gpa, ":");
+    try command.append(gpa, kind);
+    try command.appendSlice(gpa, "\\033\\\\'");
+}
+
+fn appendReceiptedWriteLine(
+    gpa: std.mem.Allocator,
+    command: *std.ArrayList(u8),
+    token: []const u8,
+) !void {
+    try command.appendSlice(gpa, "; ");
+    try appendShellWriteMarker(gpa, command, token, 'N');
+    try command.append(gpa, '\r');
+}
+
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-pub fn clientLoop(client_sock_fd: i32) !ClientResult {
+pub fn clientLoop(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    client_sock_fd: i32,
+    socket_dir: []const u8,
+    log_input: bool,
+) !ClientResult {
     std.log.info("client loop fd={d}", .{client_sock_fd});
-    const gpa: std.mem.Allocator = blk: {
-        if (builtin.mode == .Debug) {
-            const GPA = std.heap.DebugAllocator(.{});
-            const Static = struct {
-                var gpa: GPA = .{};
-            };
-            break :blk Static.gpa.allocator();
-        }
-        break :blk std.heap.c_allocator;
-    };
     defer lib_posix.close(client_sock_fd);
+
+    // Input-capable peers must acknowledge the daemon's immutable policy
+    // before any terminal initialization or keyboard bytes are sent.
+    var read_buf = try ipc.acknowledgeInputPolicy(gpa, client_sock_fd, log_input);
+    defer read_buf.deinit();
 
     try signal.openSignalPipe();
     signal.installWakeHandler(@intFromEnum(lib_posix.SIG.WINCH));
@@ -48,11 +76,22 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
     var poll_fds = try std.ArrayList(lib_posix.pollfd).initCapacity(gpa, 4);
     defer poll_fds.deinit(gpa);
 
-    var read_buf = try ipc.SocketBuffer.init(gpa);
-    defer read_buf.deinit();
-
     var stdout_buf = try std.ArrayList(u8).initCapacity(gpa, 4096);
     defer stdout_buf.deinit(gpa);
+
+    // The daemon can emit output while the policy acknowledgement is in
+    // flight. acknowledgeInputPolicy removes only its Ack frame and leaves
+    // all other complete or partial frames in read_buf.
+    while (read_buf.next()) |msg| {
+        if (msg.header.tag == .Output and msg.payload.len > 0) {
+            try stdout_buf.appendSlice(gpa, msg.payload);
+        }
+    }
+
+    var detach_classifier = input.StreamClassifier{};
+    var detach_pending = std.ArrayList(u8).empty;
+    defer detach_pending.deinit(gpa);
+    var detach_deadline: ?std.Io.Timestamp = null;
 
     const stdin_fd = lib_posix.STDIN_FILENO;
 
@@ -93,38 +132,27 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        const poll_timeout: i32 = if (detach_deadline) |deadline| blk: {
+            const remaining_ns = deadline.nanoseconds - std.Io.Timestamp.now(io, .awake).nanoseconds;
+            if (remaining_ns <= 0) break :blk 0;
+            break :blk @intCast(@max(1, @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+        } else -1;
+        const poll_result = try lib_posix.poll(poll_fds.items, poll_timeout);
+        if (poll_result == 0 and detach_pending.items.len > 0) {
+            // A lone Escape key is also the prefix of every encoded detach
+            // form. Give a split sequence a short assembly window, then pass
+            // Escape through so interactive applications remain responsive.
+            try ipc.appendMessage(gpa, &sock_write_buf, .Input, detach_pending.items);
+            detach_pending.clearRetainingCapacity();
+            detach_classifier.finish();
+            detach_deadline = null;
+            continue;
+        }
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
             const next_size = ipc.getTerminalSize(lib_posix.STDOUT_FILENO);
             try ipc.appendMessage(gpa, &sock_write_buf, .Resize, std.mem.asBytes(&next_size));
-        }
-
-        // Handle stdin -> socket (Input)
-        const inp_flags = (lib_posix.POLL.IN | lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL);
-        if (poll_fds.items[0].revents & inp_flags != 0) {
-            var buf: [4096]u8 = undefined;
-            const n_opt: ?usize = lib_posix.read(stdin_fd, &buf) catch |err| blk: {
-                if (err == error.WouldBlock) break :blk null;
-                return err;
-            };
-
-            if (n_opt) |n| {
-                if (n > 0) {
-                    // Check for detach sequences (ctrl+\ as first byte or Kitty escape sequence)
-                    if (util.isCtrlBackslash(buf[0..n])) {
-                        std.log.info("detach key detected", .{});
-                        try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
-                    } else {
-                        try ipc.appendMessage(gpa, &sock_write_buf, .Input, buf[0..n]);
-                    }
-                } else {
-                    std.log.info("eof stdin", .{});
-                    // EOF on stdin
-                    return ClientResult{ .kind = .detach, .session_name = null };
-                }
-            }
         }
 
         // Handle socket read (incoming Output messages from daemon)
@@ -163,9 +191,67 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
                     },
                     .Switch => {
                         std.log.info("switch session", .{});
-                        return ClientResult{ .kind = .switch_session, .session_name = try gpa.dupe(u8, msg.payload) };
+                        const target = try ipc.parseSwitchTarget(msg.payload);
+                        try socket.validateCanonicalSessionName(socket_dir, target.name);
+                        // Transition barrier: nothing already buffered for the old
+                        // connection may be carried into the next one, and unread
+                        // terminal typeahead must not become input to the target.
+                        sock_write_buf.clearRetainingCapacity();
+                        _ = cross.c.tcflush(lib_posix.STDIN_FILENO, cross.c.TCIFLUSH);
+                        return ClientResult{
+                            .kind = .switch_session,
+                            .session_name = try gpa.dupe(u8, target.name),
+                            .log_input = target.log_input,
+                        };
                     },
                     else => {},
+                }
+            }
+        }
+
+        // Socket control is processed before stdin. In particular, a Switch
+        // observed in this poll cycle returns above before any concurrently
+        // readable terminal typeahead can be consumed.
+        const inp_flags = (lib_posix.POLL.IN | lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL);
+        if (poll_fds.items[0].revents & inp_flags != 0) {
+            var buf: [4096]u8 = undefined;
+            const n_opt: ?usize = lib_posix.read(stdin_fd, &buf) catch |err| blk: {
+                if (err == error.WouldBlock) break :blk null;
+                return err;
+            };
+
+            if (n_opt) |n| {
+                if (n > 0) {
+                    // Hold an unfinished escape sequence until it can be
+                    // distinguished from an encoded Ctrl+\\ detach key. This
+                    // prevents a split detach prefix from reaching the PTY.
+                    try detach_pending.appendSlice(gpa, buf[0..n]);
+                    const detach_result: input.StreamClassifier.FeedResult = if (input.isCtrlBackslash(buf[0..n]))
+                        .ctrl_backslash
+                    else
+                        detach_classifier.feedResult(buf[0..n]);
+                    switch (detach_result) {
+                        .pending => {},
+                        .ctrl_backslash => {
+                            std.log.info("detach key detected", .{});
+                            detach_pending.clearRetainingCapacity();
+                            detach_classifier.finish();
+                            detach_deadline = null;
+                            try ipc.appendMessage(gpa, &sock_write_buf, .Detach, "");
+                        },
+                        .user_input, .ignored => {
+                            try ipc.appendMessage(gpa, &sock_write_buf, .Input, detach_pending.items);
+                            detach_pending.clearRetainingCapacity();
+                            detach_deadline = null;
+                        },
+                    }
+                    if (detach_classifier.hasPending() and detach_deadline == null) {
+                        const now = std.Io.Timestamp.now(io, .awake);
+                        detach_deadline = .{ .nanoseconds = now.nanoseconds + 50 * std.time.ns_per_ms };
+                    }
+                } else {
+                    std.log.info("eof stdin", .{});
+                    return ClientResult{ .kind = .detach, .session_name = null };
                 }
             }
         }
@@ -204,10 +290,48 @@ pub fn clientLoop(client_sock_fd: i32) !ClientResult {
     }
 }
 
+const ClientAction = enum { keep, detach, detach_all, kill };
+
+fn dispatchClientMessage(
+    daemon: *Daemon,
+    gpa: std.mem.Allocator,
+    client: *Client,
+    pty_fd: i32,
+    term: *ghostty_vt.Terminal,
+    vt_stream: anytype,
+    msg: ipc.SocketMsg,
+) !ClientAction {
+    switch (msg.header.tag) {
+        .Input => try daemon.handleInput(gpa, client, msg.payload),
+        .Send => try daemon.handleSend(gpa, client, msg.payload),
+        .Output => try daemon.handleOutput(gpa, msg.payload, vt_stream),
+        .Init => try daemon.handleInit(gpa, client, pty_fd, term, msg.payload),
+        .InputPolicy => try daemon.handleInputPolicy(gpa, client, msg.payload),
+        .Switch => try daemon.handleSwitch(gpa, msg.payload),
+        .Resize => try daemon.handleResize(gpa, client, pty_fd, term, msg.payload),
+        .Detach => return .detach,
+        .DetachAll => return .detach_all,
+        .Kill => return .kill,
+        .Info => try daemon.handleInfo(gpa, client),
+        .LabelGet => try daemon.handleLabelGet(gpa, client),
+        .LabelSet => try daemon.handleLabelSet(gpa, client, msg.payload),
+        .LabelClear => try daemon.handleLabelClear(gpa, client),
+        .History => try daemon.handleHistory(gpa, client, term, msg.payload),
+        .Run => try daemon.handleRun(gpa, client, msg.payload),
+        .Ack, .TaskComplete, .LabelData, .InputPolicyMismatch, .RequestRejected => {},
+        .Write => try daemon.handleWrite(gpa, client, msg.payload),
+        _ => std.log.warn("ignoring unknown IPC tag={d}", .{@intFromEnum(msg.header.tag)}),
+    }
+    return .keep;
+}
+
 /// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
 /// clients.  It uses poll() as its non-blocking mechanism.
 fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_fd: lib_posix.socket_t, pty_fd: i32) !void {
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
+    if (daemon.log_input) {
+        std.log.warn("SECURITY WARNING: PTY input logging is enabled for session={s}", .{daemon.session_name});
+    }
 
     try signal.openSignalPipe();
     signal.installWakeHandler(@intFromEnum(lib_posix.SIG.TERM));
@@ -240,7 +364,8 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
         });
 
         var pty_events: i16 = lib_posix.POLL.IN;
-        if (daemon.pty_write_buf.items.len > 0) {
+        const pty_write_ready = !daemon.pty_write_waiting_for_marker;
+        if (daemon.pty_write_buf.items.len > 0 and pty_write_ready) {
             pty_events |= lib_posix.POLL.OUT;
         }
         try poll_fds.append(gpa, .{
@@ -263,7 +388,9 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             });
         }
 
-        _ = try lib_posix.poll(poll_fds.items, -1);
+        _ = try lib_posix.poll(poll_fds.items, daemon.inputPollTimeout(io));
+        try daemon.expireWriteTransaction(gpa, io);
+        try daemon.flushExpiredPendingInput(gpa, io);
 
         if (poll_fds.items[2].revents & lib_posix.POLL.IN != 0) {
             signal.drainSignalPipe();
@@ -324,6 +451,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     // On the next iteration, daemon.running will be false.
                     daemon.running = false;
                 } else {
+                    try daemon.observeWriteMarker(gpa, buf[0..n]);
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
                     daemon.has_pty_output = true;
@@ -337,7 +465,10 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     if (!daemon.has_terminal_client and
                         daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
                     {
-                        util.respondToDeviceAttributes(gpa, &daemon.pty_write_buf, buf[0..n]);
+                        var response = std.ArrayList(u8).empty;
+                        defer response.deinit(gpa);
+                        util.respondToDeviceAttributes(gpa, &response, buf[0..n]);
+                        _ = daemon.queuePtyInput(gpa, response.items);
                     }
 
                     // In run mode, scan output for exit code marker. The marker
@@ -358,8 +489,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
                             // Notify connected clients
                             for (daemon.clients.items) |c| {
-                                ipc.appendMessage(gpa, &c.write_buf, .TaskComplete, &[_]u8{exit_code}) catch {};
-                                c.has_pending_output = true;
+                                c.appendMessage(gpa, .TaskComplete, &[_]u8{exit_code}) catch {};
                             }
                         }
 
@@ -376,14 +506,13 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                     const broadcast_data = util.rewritePromptRedraw(gpa, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) gpa.free(broadcast_data);
                     for (daemon.clients.items) |client| {
-                        ipc.appendMessage(gpa, &client.write_buf, .Output, broadcast_data) catch |err| {
+                        client.appendMessage(gpa, .Output, broadcast_data) catch |err| {
                             std.log.warn(
                                 "failed to buffer output for client err={s}",
                                 .{@errorName(err)},
                             );
                             continue;
                         };
-                        client.has_pending_output = true;
                     }
                 }
             }
@@ -391,15 +520,34 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
 
         if (poll_fds.items[1].revents & lib_posix.POLL.OUT != 0) {
             while (daemon.pty_write_buf.items.len > 0) {
-                const n = lib_posix.write(pty_fd, daemon.pty_write_buf.items) catch |err| {
+                const transaction_len = @min(
+                    daemon.pty_write_transaction_remaining,
+                    daemon.pty_write_buf.items.len,
+                );
+                const write_len = if (transaction_len > 0)
+                    (std.mem.indexOfScalar(u8, daemon.pty_write_buf.items[0..transaction_len], '\r') orelse
+                        (transaction_len - 1)) + 1
+                else
+                    daemon.pty_write_buf.items.len;
+                const n = lib_posix.write(pty_fd, daemon.pty_write_buf.items[0..write_len]) catch |err| {
                     if (err != error.WouldBlock) {
                         std.log.warn("pty write failed: {s}", .{@errorName(err)});
                         daemon.pty_write_buf.clearRetainingCapacity();
+                        try daemon.finishWriteTransaction(gpa, false);
                     }
                     break;
                 };
                 if (n == 0) break;
+                const transaction_written = @min(n, daemon.pty_write_transaction_remaining);
+                daemon.pty_write_transaction_remaining -= transaction_written;
                 daemon.pty_write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
+                if (transaction_written > 0 and n == write_len) {
+                    // The generated line ends with a randomized shell receipt.
+                    // Do not deliver its successor until that receipt comes
+                    // back through PTY output, proving the shell consumed it.
+                    daemon.pty_write_waiting_for_marker = true;
+                    break;
+                }
             }
         }
 
@@ -418,6 +566,12 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
             i -= 1;
             const client = daemon.clients.items[i];
             const revents = poll_fds.items[i + 3].revents;
+
+            if (client.close_requested) {
+                const last = daemon.closeClient(gpa, client, i, false);
+                if (last) break :daemon_loop;
+                continue;
+            }
 
             if (revents & lib_posix.POLL.IN != 0) {
                 const n = client.read_buf.read(client.socket_fd) catch |err| {
@@ -439,36 +593,33 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 }
 
                 while (client.read_buf.next()) |msg| {
-                    switch (msg.header.tag) {
-                        .Input => try daemon.handleInput(gpa, client, msg.payload),
-                        .Send => daemon.handleSend(gpa, msg.payload),
-                        .Output => try daemon.handleOutput(gpa, msg.payload, &vt_stream),
-                        .Init => try daemon.handleInit(gpa, client, pty_fd, &term, msg.payload),
-                        .Switch => try daemon.handleSwitch(gpa, msg.payload),
-                        .Resize => try daemon.handleResize(gpa, client, pty_fd, &term, msg.payload),
-                        .Detach => {
+                    const action = dispatchClientMessage(
+                        daemon,
+                        gpa,
+                        client,
+                        pty_fd,
+                        &term,
+                        &vt_stream,
+                        msg,
+                    ) catch |err| {
+                        std.log.warn("closing client after request failure err={s}", .{@errorName(err)});
+                        const last = daemon.closeClient(gpa, client, i, false);
+                        if (last) break :daemon_loop;
+                        continue :clients_loop;
+                    };
+                    switch (action) {
+                        .detach => {
                             daemon.handleDetach(gpa, client, i);
                             break :clients_loop;
                         },
-                        .DetachAll => {
+                        .detach_all => {
                             daemon.handleDetachAll(gpa);
                             break :clients_loop;
                         },
-                        .Kill => {
+                        .kill => {
                             break :daemon_loop;
                         },
-                        .Info => try daemon.handleInfo(gpa, client),
-                        .LabelGet => try daemon.handleLabelGet(gpa, client),
-                        .LabelSet => try daemon.handleLabelSet(gpa, client, msg.payload),
-                        .LabelClear => try daemon.handleLabelClear(gpa, client),
-                        .History => try daemon.handleHistory(gpa, client, &term, msg.payload),
-                        .Run => try daemon.handleRun(gpa, client, msg.payload),
-                        .Ack, .TaskComplete, .LabelData => {},
-                        .Write => try daemon.handleWrite(gpa, client, msg.payload),
-                        _ => std.log.warn(
-                            "ignoring unknown IPC tag={d}",
-                            .{@intFromEnum(msg.header.tag)},
-                        ),
+                        .keep => {},
                     }
                 }
             }
@@ -484,6 +635,7 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
                 };
 
                 if (n > 0) {
+                    client.consumeWritten(n);
                     client.write_buf.replaceRange(gpa, 0, n, &[_]u8{}) catch unreachable;
                 }
 
@@ -500,28 +652,98 @@ fn daemonLoop(daemon: *Daemon, gpa: std.mem.Allocator, io: std.Io, server_sock_f
     }
 }
 
-const ClientResult = struct {
+pub const ClientResult = struct {
     kind: enum {
         detach,
         switch_session,
     },
     session_name: ?[]const u8,
+    log_input: bool = false,
 };
 
 /// Client represents each terminal that has connected to a session.
 ///
 /// Multiple Clients can connect to a single session.
 pub const Client = struct {
+    const BACKLOG_MAX = 4 * 1024 * 1024;
+    const MAX_SINGLE_FRAME = 64 * 1024 * 1024 + @sizeOf(ipc.Header);
+
     alloc: std.mem.Allocator,
     socket_fd: i32,
     has_pending_output: bool = false,
     read_buf: ipc.SocketBuffer,
     write_buf: std.ArrayList(u8),
+    input_policy_ack: ?bool = null,
+    input_classifier: input.StreamClassifier = .{},
+    pending_input: std.ArrayList(u8) = .empty,
+    pending_input_deadline: ?std.Io.Timestamp = null,
+    close_requested: bool = false,
+    large_frame_offset: ?usize = null,
+    large_frame_remaining: usize = 0,
+
+    pub fn appendMessage(self: *Client, gpa: std.mem.Allocator, tag: ipc.Tag, data: []const u8) !void {
+        const frame_len = @sizeOf(ipc.Header) + data.len;
+        if (data.len > ipc.maxPayloadLen(tag) or !messageFits(self.ordinaryBacklogLen(), frame_len)) {
+            self.close_requested = true;
+            std.log.warn("closing slow client with full output queue", .{});
+            return;
+        }
+        try ipc.appendMessage(gpa, &self.write_buf, tag, data);
+        self.has_pending_output = true;
+    }
+
+    /// History and terminal restoration are the only daemon responses allowed
+    /// to use the 64 MiB wire limit. At most one such frame may coexist with
+    /// the independently bounded ordinary-output backlog.
+    pub fn appendLargeMessage(self: *Client, gpa: std.mem.Allocator, tag: ipc.Tag, data: []const u8) !void {
+        const frame_len = @sizeOf(ipc.Header) + data.len;
+        if ((tag != .History and tag != .Output) or
+            data.len > ipc.maxPayloadLen(tag) or
+            frame_len > MAX_SINGLE_FRAME or
+            self.large_frame_remaining != 0 or
+            self.ordinaryBacklogLen() > BACKLOG_MAX)
+        {
+            self.close_requested = true;
+            std.log.warn("closing slow client with full large-response queue", .{});
+            return;
+        }
+
+        const offset = self.write_buf.items.len;
+        try ipc.appendMessage(gpa, &self.write_buf, tag, data);
+        self.large_frame_offset = offset;
+        self.large_frame_remaining = frame_len;
+        self.has_pending_output = true;
+    }
+
+    fn ordinaryBacklogLen(self: *const Client) usize {
+        return self.write_buf.items.len - self.large_frame_remaining;
+    }
+
+    fn messageFits(ordinary_len: usize, frame_len: usize) bool {
+        return frame_len <= BACKLOG_MAX and ordinary_len <= BACKLOG_MAX - frame_len;
+    }
+
+    fn consumeWritten(self: *Client, n: usize) void {
+        const offset = self.large_frame_offset orelse return;
+        if (n <= offset) {
+            self.large_frame_offset = offset - n;
+            return;
+        }
+
+        const consumed = @min(n - offset, self.large_frame_remaining);
+        self.large_frame_remaining -= consumed;
+        if (self.large_frame_remaining == 0) {
+            self.large_frame_offset = null;
+        } else {
+            self.large_frame_offset = 0;
+        }
+    }
 
     pub fn deinit(self: *Client) void {
         lib_posix.close(self.socket_fd);
         self.read_buf.deinit();
         self.write_buf.deinit(self.alloc);
+        self.pending_input.deinit(self.alloc);
     }
 };
 
@@ -534,11 +756,23 @@ pub const Client = struct {
 ///
 /// Conceptually it's also much simpler to reason about.
 pub const Daemon = struct {
+    io: std.Io = undefined,
     cfg: *Cfg,
     session_name: []const u8,
     socket_path: []const u8,
     // === opt ===
     pty_write_buf: std.ArrayList(u8) = .empty,
+    /// A `write` transaction is accepted into this queue atomically, then each
+    /// canonical shell line waits for a randomized receipt from PTY output.
+    /// The requesting client receives Ack only after a final size-verified
+    /// completion receipt.
+    pty_write_transaction_remaining: usize = 0,
+    pty_write_waiting_for_marker: bool = false,
+    pty_write_client_fd: ?i32 = null,
+    pty_write_deadline: ?std.Io.Timestamp = null,
+    pty_write_token: [32]u8 = @splat(0),
+    pty_write_marker_carry: [96]u8 = undefined,
+    pty_write_marker_carry_len: usize = 0,
     clients: std.ArrayList(*Client) = .empty,
     labels: std.StringHashMapUnmanaged([]u8) = .empty,
     // This control which client is the leader.  The leader controls terminal state and
@@ -557,11 +791,14 @@ pub const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     pty_fd: i32 = -1, // set by daemonLoop so handleRun can probe the foreground process
     shell: []const u8 = "/bin/sh",
+    /// Immutable for the lifetime of a session daemon.
+    log_input: bool = false,
 
     /// Create a Daemon. Caller is responsible for freeing all variables passed
     /// into the init fn.
     pub fn init(io: std.Io, cfg: *Cfg, sesh_name: []const u8, socket_path: []const u8) Daemon {
         return .{
+            .io = io,
             .cfg = cfg,
             .session_name = sesh_name,
             .socket_path = socket_path,
@@ -578,7 +815,6 @@ pub const Daemon = struct {
         }
         self.labels.deinit(gpa);
         self.pty_write_buf.deinit(gpa);
-        gpa.free(self.socket_path);
     }
 
     pub fn shutdown(self: *Daemon, gpa: std.mem.Allocator) void {
@@ -594,6 +830,9 @@ pub const Daemon = struct {
 
     pub fn closeClient(self: *Daemon, gpa: std.mem.Allocator, client: *Client, i: usize, shutdown_on_last: bool) bool {
         const fd = client.socket_fd;
+        if (self.pty_write_client_fd == fd) {
+            self.abandonWriteTransaction(gpa);
+        }
         // leader is disconnected, remove ref and let another client claim leader on input
         if (self.leader_client_fd == client.socket_fd) {
             std.log.info(
@@ -631,7 +870,7 @@ pub const Daemon = struct {
         var dir = try std.Io.Dir.openDirAbsolute(io, self.cfg.socket_dir, .{});
         defer dir.close(io);
 
-        const exists = try socket.sessionExists(io, dir, sesh_name);
+        const exists = try socket.sessionExists(io, dir, self.cfg.socket_dir, sesh_name);
         // if daemon is gone then we flip this to true
         var should_create = !exists;
 
@@ -647,7 +886,7 @@ pub const Daemon = struct {
             } else |err| switch (err) {
                 // Daemon is definitively gone: safe to replace.
                 error.ConnectionRefused => {
-                    socket.cleanupStaleSocket(io, dir, sesh_name);
+                    socket.cleanupStaleSocket(io, dir, self.cfg.socket_dir, sesh_name);
                     should_create = true;
                 },
                 // Connect failed for an unusual reason. The check is only to
@@ -671,6 +910,24 @@ pub const Daemon = struct {
 
     fn run(self: *Daemon, io: std.Io, dir: std.Io.Dir, sesh_name: []const u8) !bool {
         std.log.info("creating session={s}", .{sesh_name});
+
+        // Validate or securely create the per-session log while stderr still
+        // reaches the initiating user. The same path is reopened and
+        // revalidated after fork for the daemon's lifetime and rotations.
+        var session_log_name_buf: [4096]u8 = undefined;
+        const session_log_name = try std.fmt.bufPrint(
+            &session_log_name_buf,
+            "{s}.log",
+            .{sesh_name},
+        );
+        var session_log_path_buf: [4096]u8 = undefined;
+        var session_log_path_fba = std.heap.FixedBufferAllocator.init(&session_log_path_buf);
+        const session_log_path = try std.fs.path.join(
+            session_log_path_fba.allocator(),
+            &.{ self.cfg.log_dir, session_log_name },
+        );
+        try log.preflight(io, session_log_path);
+
         const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
         const log_fd = log.log_system.file.?.handle;
 
@@ -711,24 +968,6 @@ pub const Daemon = struct {
         defer threaded.deinit();
         const new_io = threaded.io();
 
-        { // re-initialize logs with the session name as the filename
-            log.log_system.deinit();
-            var log_buf: [4096]u8 = undefined;
-            const session_log_name = try std.fmt.bufPrint(
-                &log_buf,
-                "{s}.log",
-                .{sesh_name},
-            );
-            var fba_buf: [4096]u8 = undefined;
-            var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
-            const session_log_path = try std.fs.path.join(
-                fba.allocator(),
-                &.{ self.cfg.log_dir, session_log_name },
-            );
-            const log_mode = std.Io.File.Permissions.fromMode(self.cfg.log_mode);
-            log.log_system.init(new_io, session_log_path, log_mode) catch {};
-        }
-
         const gpa: std.mem.Allocator = blk: {
             if (builtin.mode == .Debug) {
                 const GPA = std.heap.DebugAllocator(.{});
@@ -756,6 +995,12 @@ pub const Daemon = struct {
             _ = lib_posix.waitpid(self.pid, 0);
         }
 
+        // Keep both buffers alive for the full daemon loop: LogSystem retains
+        // the path for secure rotation/reopen operations.
+        log.log_system.deinit();
+        try log.log_system.init(new_io, session_log_path);
+
+        self.io = new_io;
         try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);
         std.log.info("daemon loop shutdown", .{});
         return true;
@@ -766,8 +1011,141 @@ pub const Daemon = struct {
         self.leader_client_fd = client.socket_fd;
         // Send a resize message to the client so it can send us back their window size
         // so we can resize the pty and ghostty state.
-        try ipc.appendMessage(gpa, &client.write_buf, .Resize, "");
-        client.has_pending_output = true;
+        try client.appendMessage(gpa, .Resize, "");
+    }
+
+    fn inputPollTimeout(self: *Daemon, io: std.Io) i32 {
+        const now = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        var timeout: i32 = -1;
+        if (self.pty_write_deadline) |deadline| {
+            const remaining_ns = deadline.nanoseconds - now;
+            timeout = if (remaining_ns <= 0)
+                0
+            else
+                @intCast(@max(1, @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+        }
+        for (self.clients.items) |client| {
+            const deadline = client.pending_input_deadline orelse continue;
+            const remaining_ns = deadline.nanoseconds - now;
+            const remaining_ms: i32 = if (remaining_ns <= 0)
+                0
+            else
+                @intCast(@max(1, @divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+            if (timeout < 0 or remaining_ms < timeout) timeout = remaining_ms;
+        }
+        return timeout;
+    }
+
+    fn expectedWriteMarker(self: *const Daemon, kind: u8, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(
+            buf,
+            WRITE_MARKER_PREFIX ++ "{s}:{c}" ++ WRITE_MARKER_SUFFIX,
+            .{ self.pty_write_token[0..], kind },
+        ) catch unreachable;
+    }
+
+    fn observeWriteMarker(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) !void {
+        if (self.pty_write_client_fd == null or !self.pty_write_waiting_for_marker) {
+            self.pty_write_marker_carry_len = 0;
+            return;
+        }
+
+        var scan: [4096 + 96]u8 = undefined;
+        const scan_len = self.pty_write_marker_carry_len + data.len;
+        @memcpy(scan[0..self.pty_write_marker_carry_len], self.pty_write_marker_carry[0..self.pty_write_marker_carry_len]);
+        @memcpy(scan[self.pty_write_marker_carry_len..scan_len], data);
+
+        var marker_buf: [96]u8 = undefined;
+        if (self.pty_write_transaction_remaining > 0) {
+            const marker = self.expectedWriteMarker('N', &marker_buf);
+            if (std.mem.indexOf(u8, scan[0..scan_len], marker) != null) {
+                self.pty_write_waiting_for_marker = false;
+                self.pty_write_marker_carry_len = 0;
+                const now = std.Io.Timestamp.now(self.io, .awake);
+                self.pty_write_deadline = .{ .nanoseconds = now.nanoseconds + 4 * std.time.ns_per_s };
+                return;
+            }
+        } else {
+            const done_marker = self.expectedWriteMarker('D', &marker_buf);
+            if (std.mem.indexOf(u8, scan[0..scan_len], done_marker) != null) {
+                self.pty_write_marker_carry_len = 0;
+                try self.finishWriteTransaction(gpa, true);
+                return;
+            }
+            const failed_marker = self.expectedWriteMarker('F', &marker_buf);
+            if (std.mem.indexOf(u8, scan[0..scan_len], failed_marker) != null) {
+                self.pty_write_marker_carry_len = 0;
+                try self.finishWriteTransaction(gpa, false);
+                return;
+            }
+        }
+
+        const keep = @min(self.pty_write_marker_carry.len, scan_len);
+        @memcpy(self.pty_write_marker_carry[0..keep], scan[scan_len - keep .. scan_len]);
+        self.pty_write_marker_carry_len = keep;
+    }
+
+    fn finishWriteTransaction(self: *Daemon, gpa: std.mem.Allocator, success: bool) !void {
+        const client_fd = self.pty_write_client_fd;
+        self.pty_write_transaction_remaining = 0;
+        self.pty_write_waiting_for_marker = false;
+        self.pty_write_client_fd = null;
+        self.pty_write_deadline = null;
+        self.pty_write_marker_carry_len = 0;
+
+        const fd = client_fd orelse return;
+        for (self.clients.items) |client| {
+            if (client.socket_fd != fd) continue;
+            if (success) {
+                try client.appendMessage(gpa, .Ack, "");
+                self.has_had_client = true;
+            } else {
+                try client.appendMessage(gpa, .RequestRejected, "remote shell did not complete the write transaction");
+            }
+            return;
+        }
+    }
+
+    fn abandonWriteTransaction(self: *Daemon, gpa: std.mem.Allocator) void {
+        const unsent = @min(self.pty_write_transaction_remaining, self.pty_write_buf.items.len);
+        if (unsent > 0) {
+            self.pty_write_buf.replaceRange(gpa, 0, unsent, &[_]u8{}) catch unreachable;
+        }
+        self.pty_write_transaction_remaining = 0;
+        self.pty_write_waiting_for_marker = false;
+        self.pty_write_client_fd = null;
+        self.pty_write_deadline = null;
+        self.pty_write_marker_carry_len = 0;
+    }
+
+    fn expireWriteTransaction(self: *Daemon, gpa: std.mem.Allocator, io: std.Io) !void {
+        const deadline = self.pty_write_deadline orelse return;
+        if (deadline.nanoseconds > std.Io.Timestamp.now(io, .awake).nanoseconds) return;
+
+        const client_fd = self.pty_write_client_fd;
+        self.abandonWriteTransaction(gpa);
+        const fd = client_fd orelse return;
+        for (self.clients.items) |client| {
+            if (client.socket_fd == fd) {
+                try client.appendMessage(gpa, .RequestRejected, "remote shell did not acknowledge the write transaction");
+                return;
+            }
+        }
+    }
+
+    fn flushExpiredPendingInput(self: *Daemon, gpa: std.mem.Allocator, io: std.Io) !void {
+        const now = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        for (self.clients.items) |client| {
+            const deadline = client.pending_input_deadline orelse continue;
+            if (deadline.nanoseconds > now) continue;
+            client.pending_input_deadline = null;
+            client.input_classifier.finish();
+            client.input_classifier.user_input = false;
+            if (client.pending_input.items.len == 0) continue;
+            try self.setLeader(gpa, client);
+            _ = self.queuePtyInput(gpa, client.pending_input.items);
+            client.pending_input.clearRetainingCapacity();
+        }
     }
 
     const PTY_WRITE_BUF_MAX = 256 * 1024;
@@ -777,63 +1155,113 @@ pub const Daemon = struct {
     /// the old direct-write ptyWrite (drop on EAGAIN), just at a 64x higher
     /// threshold. Capping avoids OOM when the shell stops reading; dropping
     /// new (not old) bytes avoids tearing a partially-accepted sequence.
-    fn queuePtyInput(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) void {
-        if (data.len == 0) return;
-        if (self.pty_write_buf.items.len + data.len > PTY_WRITE_BUF_MAX) {
-            std.log.warn(
-                "pty input dropped {d} bytes (buffer full, shell not reading)",
-                .{data.len},
-            );
-            return;
+    fn queuePtyInput(self: *Daemon, gpa: std.mem.Allocator, data: []const u8) bool {
+        if (data.len == 0) return true;
+        if (data.len > PTY_WRITE_BUF_MAX or self.pty_write_buf.items.len > PTY_WRITE_BUF_MAX - data.len) {
+            if (self.log_input) {
+                std.log.warn("pty input dropped (buffer full, shell not reading)", .{});
+            } else {
+                std.log.warn("pty input dropped (buffer full, shell not reading; input logging disabled)", .{});
+            }
+            return false;
         }
-        std.log.debug("buffering pty input data={x}", .{data});
         self.pty_write_buf.appendSlice(gpa, data) catch |err| {
-            std.log.warn(
-                "pty input dropped {d} bytes: {s}",
-                .{ data.len, @errorName(err) },
-            );
+            std.log.warn("pty input dropped: {s}", .{@errorName(err)});
+            return false;
         };
+        if (self.log_input) std.log.warn("PTY INPUT (explicitly enabled) data={x}", .{data});
+        return true;
     }
 
     pub fn handleInput(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
-        std.log.debug("buffering pty input data={x}", .{payload});
+        if (!try self.requireInputPolicy(gpa, client)) return;
         // client is leader, send entire payload (ansi escape codes + text)
         if (self.leader_client_fd == client.socket_fd) {
-            self.queuePtyInput(gpa, payload);
+            _ = self.queuePtyInput(gpa, payload);
             return;
         }
 
         // check if leader needs to be updated by detecting any user input
-        if (util.isUserInput(payload)) {
+        client.pending_input.appendSlice(gpa, payload) catch {
+            client.input_classifier.finish();
+            client.pending_input.clearRetainingCapacity();
+            client.pending_input_deadline = null;
+            std.log.warn("input classification buffer dropped", .{});
+            return;
+        };
+        client.input_classifier.feed(payload);
+        if (client.input_classifier.user_input) {
+            client.input_classifier.user_input = false;
             try self.setLeader(gpa, client);
-            self.queuePtyInput(gpa, payload);
+            _ = self.queuePtyInput(gpa, client.pending_input.items);
+            client.pending_input.clearRetainingCapacity();
+            client.pending_input_deadline = null;
+        } else if (client.input_classifier.pending_len > 0) {
+            // Retain only the unfinished item. Completed mouse/focus reports
+            // remain read-only, while a split keyboard sequence can be sent
+            // intact if its continuation claims leadership.
+            const pending = client.input_classifier.pending[0..client.input_classifier.pending_len];
+            client.pending_input.clearRetainingCapacity();
+            try client.pending_input.appendSlice(gpa, pending);
+            if (client.pending_input_deadline == null) {
+                const now = std.Io.Timestamp.now(self.io, .awake);
+                client.pending_input_deadline = .{ .nanoseconds = now.nanoseconds + 50 * std.time.ns_per_ms };
+            }
+        } else {
+            client.pending_input.clearRetainingCapacity();
+            client.pending_input_deadline = null;
         }
     }
 
     /// Queue input from `zmx send` without changing interactive client leadership.
-    pub fn handleSend(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8) void {
-        self.queuePtyInput(gpa, payload);
+    pub fn handleSend(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+        if (!try self.requireInputPolicy(gpa, client)) return;
+        _ = self.queuePtyInput(gpa, payload);
+    }
+
+    fn handleInputPolicy(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+        if (payload.len != @sizeOf(ipc.InputPolicy)) {
+            client.input_policy_ack = null;
+            try client.appendMessage(gpa, .InputPolicyMismatch, "invalid input policy declaration");
+        } else {
+            const declared = std.mem.bytesToValue(ipc.InputPolicy, payload).value();
+            if (declared != null and declared.? == self.log_input) {
+                client.input_policy_ack = declared;
+                try client.appendMessage(gpa, .Ack, "");
+            } else {
+                client.input_policy_ack = null;
+                try client.appendMessage(gpa, .InputPolicyMismatch, "session input logging policy differs; use --log-input only for logging-enabled sessions");
+            }
+        }
+    }
+
+    fn requireInputPolicy(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !bool {
+        if (client.input_policy_ack == self.log_input) return true;
+        try client.appendMessage(gpa, .InputPolicyMismatch, "input rejected: logging policy was not acknowledged");
+        return false;
     }
 
     pub fn handleSwitch(self: *Daemon, gpa: std.mem.Allocator, session_name: []const u8) !void {
+        const target = ipc.parseSwitchTarget(session_name) catch {
+            std.log.warn("rejected invalid switch target", .{});
+            return;
+        };
+        socket.validateCanonicalSessionName(self.cfg.socket_dir, target.name) catch {
+            std.log.warn("rejected invalid switch target", .{});
+            return;
+        };
         for (self.clients.items) |client| {
             if (self.leader_client_fd == client.socket_fd) {
-                ipc.appendMessage(
-                    gpa,
-                    &client.write_buf,
-                    .Switch,
-                    session_name,
-                ) catch |err| {
+                client.appendMessage(gpa, .Switch, session_name) catch |err| {
                     std.log.warn(
                         "failed to buffer terminal state for client err={s}",
                         .{@errorName(err)},
                     );
                 };
-                client.has_pending_output = true;
                 return;
             }
         }
-        return error.NoLeaderFound;
+        std.log.warn("ignored switch request without a leader", .{});
     }
 
     pub fn handleInit(
@@ -864,13 +1292,12 @@ pub const Daemon = struct {
                 const restore_data = util.rewritePromptRedraw(gpa, term_output) orelse term_output;
                 defer gpa.free(term_output);
                 defer if (restore_data.ptr != term_output.ptr) gpa.free(restore_data);
-                ipc.appendMessage(gpa, &client.write_buf, .Output, restore_data) catch |err| {
+                client.appendLargeMessage(gpa, .Output, restore_data) catch |err| {
                     std.log.warn(
                         "failed to buffer terminal state for client err={s}",
                         .{@errorName(err)},
                     );
                 };
-                client.has_pending_output = true;
             }
         }
 
@@ -1020,8 +1447,7 @@ pub const Daemon = struct {
         info.cwd_len = @intCast(@min(self.cwd.len, ipc.MAX_CWD_LEN));
         @memcpy(info.cwd[0..info.cwd_len], self.cwd[0..info.cwd_len]);
 
-        try ipc.appendMessage(gpa, &client.write_buf, .Info, std.mem.asBytes(&info));
-        client.has_pending_output = true;
+        try client.appendMessage(gpa, .Info, std.mem.asBytes(&info));
     }
 
     pub fn handleHistory(
@@ -1031,28 +1457,27 @@ pub const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        const format: util.HistoryFormat = if (payload.len > 0)
-            @enumFromInt(payload[0])
-        else
-            .plain;
+        const format: util.HistoryFormat = if (payload.len == 0)
+            .plain
+        else switch (payload[0]) {
+            0 => .plain,
+            1 => .vt,
+            2 => .html,
+            else => {
+                std.log.warn("rejected invalid history format", .{});
+                return;
+            },
+        };
         if (util.serializeTerminal(gpa, term, format)) |output| {
             defer gpa.free(output);
-            try ipc.appendMessage(gpa, &client.write_buf, .History, output);
-            client.has_pending_output = true;
+            try client.appendLargeMessage(gpa, .History, output);
         } else {
-            try ipc.appendMessage(gpa, &client.write_buf, .History, "");
-            client.has_pending_output = true;
+            try client.appendLargeMessage(gpa, .History, "");
         }
     }
 
     pub fn handleRun(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
-        // Reset task tracking so the new command's exit marker is detected.
-        // Without this, a second `zmx run` on the same session is ignored
-        // because task_exit_code is still set from the first run.
-        self.task_exit_code = null;
-        self.task_ended_at = null;
-        self.is_task_mode = true;
-
+        if (!try self.requireInputPolicy(gpa, client)) return;
         if (payload.len == 0) return;
 
         const cmd = payload;
@@ -1065,25 +1490,33 @@ pub const Daemon = struct {
         const heredoc_marker = "\r\necho ZMX_TASK_COMPLETED:$?\r";
         const uses_heredoc = std.mem.indexOf(u8, cmd, "<<") != null;
 
+        var pty_command = std.ArrayList(u8).empty;
+        defer pty_command.deinit(gpa);
         if (cmd.len > 0 and cmd[cmd.len - 1] == '\r') {
-            self.queuePtyInput(gpa, cmd[0 .. cmd.len - 1]);
+            try pty_command.appendSlice(gpa, cmd[0 .. cmd.len - 1]);
         } else {
-            self.queuePtyInput(gpa, cmd);
+            try pty_command.appendSlice(gpa, cmd);
         }
-        self.queuePtyInput(gpa, if (uses_heredoc) heredoc_marker else single_line_marker);
+        try pty_command.appendSlice(gpa, if (uses_heredoc) heredoc_marker else single_line_marker);
+        if (!self.queuePtyInput(gpa, pty_command.items)) {
+            try client.appendMessage(gpa, .RequestRejected, "PTY input queue is busy or request is too large");
+            return;
+        }
 
-        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
-        client.has_pending_output = true;
+        // Reset task tracking only after the command is accepted, so a busy
+        // queue cannot erase the prior task result or change session mode.
+        self.task_exit_code = null;
+        self.task_ended_at = null;
+        self.is_task_mode = true;
+        try client.appendMessage(gpa, .Ack, "");
         self.has_had_client = true;
-        std.log.debug("run command len={d}", .{payload.len});
     }
 
     pub fn handleOutput(self: *Daemon, gpa: std.mem.Allocator, payload: []const u8, vt_stream: anytype) !void {
         vt_stream.nextSlice(payload);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
-            try ipc.appendMessage(gpa, &client.write_buf, .Output, payload);
-            client.has_pending_output = true;
+            try client.appendMessage(gpa, .Output, payload);
         }
         if (self.clients.items.len > 0) {
             lib_posix.kill(self.pid, lib_posix.SIG.WINCH) catch |err| {
@@ -1093,24 +1526,78 @@ pub const Daemon = struct {
     }
 
     pub fn handleWrite(self: *Daemon, gpa: std.mem.Allocator, client: *Client, payload: []const u8) !void {
+        if (!try self.requireInputPolicy(gpa, client)) return;
         // Wire format: [u32 path len][path bytes][file content]
-        if (payload.len < @sizeOf(u32)) return error.InvalidPayload;
-        const path_len = std.mem.bytesToValue(u32, payload[0..@sizeOf(u32)]);
-        if (payload.len < @sizeOf(u32) + path_len) return error.InvalidPayload;
+        if (payload.len < @sizeOf(u32)) {
+            std.log.warn("rejected invalid write payload", .{});
+            return;
+        }
+        const path_len: usize = @intCast(std.mem.bytesToValue(u32, payload[0..@sizeOf(u32)]));
+        if (path_len > payload.len - @sizeOf(u32)) {
+            std.log.warn("rejected invalid write payload", .{});
+            return;
+        }
         const file_path = payload[@sizeOf(u32)..][0..path_len];
         const file_content = payload[@sizeOf(u32) + path_len ..];
 
         // Inject file creation through the PTY so it works over SSH.
         // Base64-encode content and pipe through printf | base64 -d > file.
-        // Chunk large files to stay under command-line length limits.
-        // 48000 is divisible by 3 (clean base64 boundaries) and encodes
-        // to ~64KB, well under typical ARG_MAX.
-        const chunk_size = 48000;
-        var offset: usize = 0;
-        var is_first = true;
+        if (path_len == 0 or
+            path_len > ipc.MAX_WRITE_PATH_LEN or
+            std.mem.indexOfScalar(u8, file_path, 0) != null or
+            file_content.len > ipc.MAX_WRITE_CONTENT_LEN)
+        {
+            try client.appendMessage(gpa, .RequestRejected, "write path or content exceeds the supported limit");
+            return;
+        }
 
-        while (offset < file_content.len or is_first) {
-            const end = @min(offset + chunk_size, file_content.len);
+        // Only one write transaction may own the front of the PTY queue. This
+        // makes its full userspace acceptance atomic and lets every generated
+        // line wait for a randomized receipt from the remote shell.
+        if (self.pty_write_client_fd != null or self.pty_write_buf.items.len != 0) {
+            try client.appendMessage(gpa, .RequestRejected, "PTY input queue is busy");
+            return;
+        }
+
+        var pty_command = std.ArrayList(u8).empty;
+        defer pty_command.deinit(gpa);
+        var random_token: [16]u8 = undefined;
+        try self.io.randomSecure(&random_token);
+        var token: [32]u8 = undefined;
+        const hex = "0123456789abcdef";
+        for (random_token, 0..) |byte, i| {
+            token[i * 2] = hex[byte >> 4];
+            token[i * 2 + 1] = hex[byte & 0x0f];
+        }
+
+        const content_chunk_size = 2880; // divisible by 3 -> 3840 base64 bytes
+        const encoded_path_len = std.base64.standard.Encoder.calcSize(file_path.len);
+        const encoded_path = try gpa.alloc(u8, encoded_path_len);
+        defer gpa.free(encoded_path);
+        _ = std.base64.standard.Encoder.encode(encoded_path, file_path);
+
+        try pty_command.appendSlice(gpa, "zmx_write_path_b64=''");
+        try appendReceiptedWriteLine(gpa, &pty_command, &token);
+        const path_chunk_size = 3000;
+        var path_offset: usize = 0;
+        while (path_offset < encoded_path.len) {
+            const path_end = @min(path_offset + path_chunk_size, encoded_path.len);
+            try pty_command.appendSlice(gpa, "zmx_write_path_b64=\"${zmx_write_path_b64}");
+            try pty_command.appendSlice(gpa, encoded_path[path_offset..path_end]);
+            try pty_command.append(gpa, '"');
+            try appendReceiptedWriteLine(gpa, &pty_command, &token);
+            path_offset = path_end;
+        }
+        // The trailing sentinel prevents command substitution from stripping
+        // valid newline bytes at the end of the decoded Unix path.
+        try pty_command.appendSlice(gpa, "zmx_write_path=$(printf '%s' \"$zmx_write_path_b64\" | base64 -d; printf x); zmx_write_path=${zmx_write_path%x}");
+        try appendReceiptedWriteLine(gpa, &pty_command, &token);
+        try pty_command.appendSlice(gpa, ": > \"$zmx_write_path\"");
+        try appendReceiptedWriteLine(gpa, &pty_command, &token);
+
+        var offset: usize = 0;
+        while (offset < file_content.len) {
+            const end = @min(offset + content_chunk_size, file_content.len);
             const chunk = file_content[offset..end];
 
             const encoded_len = std.base64.standard.Encoder.calcSize(chunk.len);
@@ -1118,35 +1605,40 @@ pub const Daemon = struct {
             defer gpa.free(encoded);
             _ = std.base64.standard.Encoder.encode(encoded, chunk);
 
-            self.queuePtyInput(gpa, "printf '%s' '");
-            self.queuePtyInput(gpa, encoded);
-            if (is_first) {
-                self.queuePtyInput(gpa, "' | base64 -d > '");
-            } else {
-                self.queuePtyInput(gpa, "' | base64 -d >> '");
-            }
-            self.queuePtyInput(gpa, file_path);
-            self.queuePtyInput(gpa, "'");
-            self.queuePtyInput(gpa, "\r");
+            try pty_command.appendSlice(gpa, "printf '%s' '");
+            try pty_command.appendSlice(gpa, encoded);
+            try pty_command.appendSlice(gpa, "' | base64 -d >> \"$zmx_write_path\"");
+            try appendReceiptedWriteLine(gpa, &pty_command, &token);
 
             offset = end;
-            is_first = false;
+        }
+        const expected_size = try std.fmt.allocPrint(gpa, "{d}", .{file_content.len});
+        defer gpa.free(expected_size);
+        try pty_command.appendSlice(gpa, "zmx_write_size=$(wc -c < \"$zmx_write_path\" 2>/dev/null) || zmx_write_size=-1; if [ \"$zmx_write_size\" -eq ");
+        try pty_command.appendSlice(gpa, expected_size);
+        try pty_command.appendSlice(gpa, " ] 2>/dev/null; then unset zmx_write_path zmx_write_path_b64 zmx_write_size; ");
+        try appendShellWriteMarker(gpa, &pty_command, &token, 'D');
+        try pty_command.appendSlice(gpa, "; else unset zmx_write_path zmx_write_path_b64 zmx_write_size; ");
+        try appendShellWriteMarker(gpa, &pty_command, &token, 'F');
+        try pty_command.appendSlice(gpa, "; fi\r");
+
+        if (!self.queuePtyInput(gpa, pty_command.items)) {
+            try client.appendMessage(gpa, .RequestRejected, "PTY input queue is busy or request is too large");
+            return;
         }
 
-        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
-        client.has_pending_output = true;
-        self.has_had_client = true;
-        std.log.debug(
-            "write command len={d} file_path={s}",
-            .{ file_content.len, file_path },
-        );
+        self.pty_write_transaction_remaining = pty_command.items.len;
+        self.pty_write_waiting_for_marker = false;
+        self.pty_write_client_fd = client.socket_fd;
+        self.pty_write_token = token;
+        const now = std.Io.Timestamp.now(self.io, .awake);
+        self.pty_write_deadline = .{ .nanoseconds = now.nanoseconds + 4 * std.time.ns_per_s };
     }
 
     fn handleLabelGet(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
         const out = try label.labelsToU8(gpa, self.labels);
         defer gpa.free(out);
-        try ipc.appendMessage(gpa, &client.write_buf, .LabelData, out);
-        client.has_pending_output = true;
+        try client.appendMessage(gpa, .LabelData, out);
     }
 
     fn handleLabelSet(self: *Daemon, gpa: std.mem.Allocator, client: *Client, labels: []const u8) !void {
@@ -1175,8 +1667,7 @@ pub const Daemon = struct {
             }
         }
 
-        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
-        client.has_pending_output = true;
+        try client.appendMessage(gpa, .Ack, "");
     }
 
     fn handleLabelClear(self: *Daemon, gpa: std.mem.Allocator, client: *Client) !void {
@@ -1186,8 +1677,7 @@ pub const Daemon = struct {
             gpa.free(entry.value_ptr.*);
         }
         self.labels.clearRetainingCapacity();
-        try ipc.appendMessage(gpa, &client.write_buf, .Ack, "");
-        client.has_pending_output = true;
+        try client.appendMessage(gpa, .Ack, "");
     }
 };
 
@@ -1204,9 +1694,213 @@ test "send queues PTY input without changing leader" {
         .created_at = 0,
     };
     defer daemon.pty_write_buf.deinit(alloc);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = .empty,
+        .input_policy_ack = false,
+    };
+    defer client.read_buf.deinit();
+    defer client.write_buf.deinit(alloc);
+    defer client.pending_input.deinit(alloc);
 
-    daemon.handleSend(alloc, "hello");
+    try daemon.handleSend(alloc, &client, "hello");
 
     try std.testing.expectEqual(@as(?i32, 42), daemon.leader_client_fd);
     try std.testing.expectEqualStrings("hello", daemon.pty_write_buf.items);
+}
+
+test "input policy mismatch rejects bytes before PTY queue" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .io = std.testing.io,
+        .cfg = undefined,
+        .session_name = "test",
+        .socket_path = "",
+        .created_at = 0,
+        .log_input = true,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = .empty,
+        .input_policy_ack = false,
+    };
+    defer client.read_buf.deinit();
+    defer client.write_buf.deinit(alloc);
+    defer client.pending_input.deinit(alloc);
+
+    try daemon.handleSend(alloc, &client, "secret");
+
+    try std.testing.expectEqual(@as(usize, 0), daemon.pty_write_buf.items.len);
+    try std.testing.expect(client.has_pending_output);
+    const header = std.mem.bytesToValue(ipc.Header, client.write_buf.items[0..@sizeOf(ipc.Header)]);
+    try std.testing.expectEqual(ipc.Tag.InputPolicyMismatch, header.tag);
+}
+
+test "malformed write length is rejected before PTY queue" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .session_name = "test",
+        .socket_path = "",
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = .empty,
+        .input_policy_ack = false,
+    };
+    defer client.read_buf.deinit();
+    defer client.write_buf.deinit(alloc);
+    defer client.pending_input.deinit(alloc);
+
+    const malicious_len: u32 = std.math.maxInt(u32);
+    try daemon.handleWrite(alloc, &client, std.mem.asBytes(&malicious_len));
+
+    try std.testing.expectEqual(@as(usize, 0), daemon.pty_write_buf.items.len);
+    try std.testing.expectEqual(@as(usize, 0), client.write_buf.items.len);
+}
+
+test "daemon input logging policy defaults off and is immutable state" {
+    const daemon = Daemon.init(std.testing.io, undefined, "test", "");
+    try std.testing.expect(!daemon.log_input);
+}
+
+test "split keyboard input claims leadership and queues the complete sequence" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .io = std.testing.io,
+        .cfg = undefined,
+        .session_name = "test",
+        .socket_path = "",
+        .created_at = 0,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = .empty,
+        .input_policy_ack = false,
+    };
+    defer client.read_buf.deinit();
+    defer client.write_buf.deinit(alloc);
+    defer client.pending_input.deinit(alloc);
+
+    try daemon.handleInput(alloc, &client, "\x1b[1;");
+    try std.testing.expectEqual(@as(?i32, null), daemon.leader_client_fd);
+    try std.testing.expectEqual(@as(usize, 0), daemon.pty_write_buf.items.len);
+
+    try daemon.handleInput(alloc, &client, "5C");
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b[1;5C", daemon.pty_write_buf.items);
+}
+
+test "standalone escape from nonleader claims leadership after deadline" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .io = std.testing.io,
+        .cfg = undefined,
+        .session_name = "test",
+        .socket_path = "",
+        .created_at = 0,
+        .leader_client_fd = 99,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+    defer daemon.clients.deinit(alloc);
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = 7,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = .empty,
+        .input_policy_ack = false,
+    };
+    defer client.read_buf.deinit();
+    defer client.write_buf.deinit(alloc);
+    defer client.pending_input.deinit(alloc);
+    try daemon.clients.append(alloc, &client);
+
+    try daemon.handleInput(alloc, &client, "\x1b");
+    try std.testing.expectEqual(@as(?i32, 99), daemon.leader_client_fd);
+    try std.testing.expectEqual(@as(usize, 0), daemon.pty_write_buf.items.len);
+
+    client.pending_input_deadline = .zero;
+    try daemon.flushExpiredPendingInput(alloc, std.testing.io);
+    try std.testing.expectEqual(@as(?i32, 7), daemon.leader_client_fd);
+    try std.testing.expectEqualStrings("\x1b", daemon.pty_write_buf.items);
+}
+
+test "slow client output queue is bounded" {
+    try std.testing.expect(Client.messageFits(0, Client.BACKLOG_MAX));
+    try std.testing.expect(!Client.messageFits(1, Client.BACKLOG_MAX));
+    try std.testing.expect(!Client.messageFits(0, Client.BACKLOG_MAX + 1));
+}
+
+test "ordinary output remains bounded alongside one large response" {
+    const alloc = std.testing.allocator;
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = -1,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = .empty,
+    };
+    defer client.read_buf.deinit();
+    defer client.write_buf.deinit(alloc);
+    defer client.pending_input.deinit(alloc);
+
+    const large = try alloc.alloc(u8, 1024 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'h');
+    try client.appendLargeMessage(alloc, .History, large);
+    const large_frame_len = client.large_frame_remaining;
+
+    var output: [4096]u8 = @splat('o');
+    while (!client.close_requested) {
+        try client.appendMessage(alloc, .Output, &output);
+    }
+
+    try std.testing.expect(client.ordinaryBacklogLen() <= Client.BACKLOG_MAX);
+    try std.testing.expectEqual(large_frame_len, client.large_frame_remaining);
+    try std.testing.expect(client.write_buf.items.len <= large_frame_len + Client.BACKLOG_MAX);
+}
+
+test "rejected run preserves previous task state" {
+    const alloc = std.testing.allocator;
+    var daemon = Daemon{
+        .cfg = undefined,
+        .session_name = "test",
+        .socket_path = "",
+        .created_at = 0,
+        .is_task_mode = false,
+        .task_exit_code = 23,
+        .task_ended_at = 456,
+    };
+    defer daemon.pty_write_buf.deinit(alloc);
+    try daemon.pty_write_buf.resize(alloc, Daemon.PTY_WRITE_BUF_MAX);
+
+    var client = Client{
+        .alloc = alloc,
+        .socket_fd = -1,
+        .read_buf = try ipc.SocketBuffer.init(alloc),
+        .write_buf = .empty,
+        .input_policy_ack = false,
+    };
+    defer client.read_buf.deinit();
+    defer client.write_buf.deinit(alloc);
+    defer client.pending_input.deinit(alloc);
+
+    try daemon.handleRun(alloc, &client, "true");
+
+    try std.testing.expect(!daemon.is_task_mode);
+    try std.testing.expectEqual(@as(?u8, 23), daemon.task_exit_code);
+    try std.testing.expectEqual(@as(?u64, 456), daemon.task_ended_at);
+    const header = std.mem.bytesToValue(ipc.Header, client.write_buf.items[0..@sizeOf(ipc.Header)]);
+    try std.testing.expectEqual(ipc.Tag.RequestRejected, header.tag);
 }

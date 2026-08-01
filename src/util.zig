@@ -1,5 +1,6 @@
 const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
+const input_classifier = @import("input.zig");
 const ipc = @import("ipc.zig");
 const socket = @import("socket.zig");
 const label = @import("label.zig");
@@ -43,7 +44,11 @@ pub fn get_session_entries(
     var sessions = try std.ArrayList(SessionEntry).initCapacity(alloc, 30);
 
     while (try iter.next(io)) |entry| {
-        const exists = socket.sessionExists(io, dir, entry.name) catch continue;
+        // ZMX_DIR may also contain the secured `logs` directory. Only socket
+        // directory entries are session candidates; explicit session access
+        // still validates wrong-type and symlink paths fail-closed.
+        if (entry.kind != .unix_domain_socket) continue;
+        const exists = socket.sessionExists(io, dir, socket_dir, entry.name) catch continue;
         if (exists) {
             const name = try alloc.dupe(u8, entry.name);
             errdefer alloc.free(name);
@@ -70,7 +75,7 @@ pub fn get_session_entries(
                 // daemon can miss the probe timeout; deleting its socket
                 // orphans it permanently.
                 if (err == error.ConnectionRefused) {
-                    socket.cleanupStaleSocket(io, dir, entry.name);
+                    socket.cleanupStaleSocket(io, dir, socket_dir, entry.name);
                 }
                 continue;
             };
@@ -404,208 +409,11 @@ pub fn stripAnsi(alloc: std.mem.Allocator, data: []const u8) ![]const u8 {
     return result.toOwnedSlice(alloc);
 }
 
-/// Dcts Ctrl+\ across raw, Kitty CSI u, and xterm modifyOtherKeys encodings.
-pub fn isCtrlBackslash(buf: []const u8) bool {
-    if (buf.len == 0) return false;
-    return buf[0] == 0x1C or isKeyPressed(buf, 0x5c, 0b100) or isModifyOtherKey(buf, 0x5c, 0b100);
-}
-
-/// Scans the buffer for an xterm modifyOtherKeys-encoded keypress.
-/// Format: CSI 27 ; <modifier> ; <keycode> ~
-/// Reference: invisible-island.net/xterm/ctlseqs/ctlseqs.html (modifyOtherKeys).
-fn isModifyOtherKey(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
-    var i: usize = 0;
-    while (i + 1 < buf.len) : (i += 1) {
-        if (buf[i] == 0x1b and buf[i + 1] == '[') {
-            if (modifyOtherMatches(buf[i + 2 ..], expected_key, expected_mods)) return true;
-        }
-    }
-    return false;
-}
-
-/// Parses the body of an xterm modifyOtherKeys CSI sequence (after the leading
-/// `\x1b[`). Mirrors keypressWithMod's tolerance for lock modifiers.
-fn modifyOtherMatches(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
-    var pos: usize = 0;
-
-    // 1. Sentinel: literal "27" identifies xterm modifyOtherKeys.
-    const sentinel = parseDecimal(buf, &pos) orelse return false;
-    if (sentinel != 27) return false;
-
-    // 2. Expect ';' before modifier.
-    if (pos >= buf.len or buf[pos] != ';') return false;
-    pos += 1;
-
-    // 3. Parse modifier (xterm encodes as 1 + bitfield, same as kitty).
-    const mod_encoded = parseDecimal(buf, &pos) orelse return false;
-    if (mod_encoded < 1) return false;
-    const mod_raw = mod_encoded - 1;
-    // Tolerate ambient lock modifiers (caps_lock=64, num_lock=128).
-    const intentional_mods = mod_raw & 0b00111111;
-    if (expected_mods > 0 and expected_mods != intentional_mods) return false;
-
-    // 4. Expect ';' before keycode.
-    if (pos >= buf.len or buf[pos] != ';') return false;
-    pos += 1;
-
-    // 5. Parse keycode.
-    const key_code = parseDecimal(buf, &pos) orelse return false;
-    if (key_code != expected_key) return false;
-
-    // 6. Expect '~' terminator.
-    return pos < buf.len and buf[pos] == '~';
-}
-
-/// Detects vt100 or kitty keyboard protocol escape sequence for up arrow.
-pub fn isUpArrow(buf: []const u8) bool {
-    return std.mem.eql(u8, buf, "\x1b[A") or std.mem.eql(u8, buf, "\x1b[1;1:1A");
-}
-
-fn isKeyPressed(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
-    // Scan for any CSI u sequence encoding in the buffer.
-    var i: usize = 0;
-    while (i + 2 < buf.len) : (i += 1) {
-        if (buf[i] == 0x1b and buf[i + 1] == '[') {
-            if (keypressWithMod(buf[i + 2 ..], expected_key, expected_mods)) return true;
-        }
-    }
-    return false;
-}
-
-/// Parses the general CSI u form:
-///   CSI key-code[:alternates] ; modifiers[:event-type] [; text-codepoints] u
-///
-/// Event type is press (1 or absent) or repeat (2). Rejects release (3).
-/// Tolerates additional modifiers (caps_lock, num_lock)
-/// and alternate key sub-fields from the kitty protocol's progressive
-/// enhancement flags.
-fn keypressWithMod(buf: []const u8, expected_key: u32, expected_mods: u32) bool {
-    const parsed = parseKittyCsiU(buf) orelse return false;
-    if (parsed.key_code != expected_key) return false;
-
-    // Only accept intentional modifiers. Lock modifiers
-    // (caps_lock=0b1000000, num_lock=0b10000000) are tolerated because
-    // they are ambient state, not deliberate key combinations.
-    const intentional_mods = parsed.modifiers & 0b00111111;
-    if (expected_mods > 0 and expected_mods != intentional_mods) return false;
-
-    // 3 = release -- reject. Accept press (1) and repeat (2).
-    return parsed.event_type != 3;
-}
-
-const KittyCsiU = struct {
-    key_code: u32,
-    modifiers: u32,
-    event_type: u32,
-    consumed: usize,
-};
-
-fn parseKittyCsiU(buf: []const u8) ?KittyCsiU {
-    var pos: usize = 0;
-
-    // 1. Parse key code.
-    const key_code = parseDecimal(buf, &pos) orelse return null;
-
-    // 2. Skip any ':alternate-key' sub-fields (shifted key, base layout key).
-    while (pos < buf.len and buf[pos] == ':') {
-        pos += 1; // consume ':'
-        _ = parseDecimal(buf, &pos); // consume digits (may be empty for ::base)
-    }
-
-    // 3. Expect ';' separator before modifiers.
-    if (pos >= buf.len or buf[pos] != ';') return null;
-    pos += 1;
-
-    // 4. Parse modifier value. Kitty encodes as 1 + bitfield.
-    const mod_encoded = parseDecimal(buf, &pos) orelse return null;
-    if (mod_encoded < 1) return null;
-    const mod_raw = mod_encoded - 1;
-
-    var event_type: u32 = 1;
-    // 5. Parse optional event type after ':'.
-    if (pos < buf.len and buf[pos] == ':') {
-        pos += 1;
-        event_type = parseDecimal(buf, &pos) orelse return null;
-    }
-
-    // 6. Skip optional ';text-codepoints' section.
-    if (pos < buf.len and buf[pos] == ';') {
-        pos += 1;
-        // Consume remaining digits and colons until 'u'.
-        while (pos < buf.len and (std.ascii.isDigit(buf[pos]) or buf[pos] == ':')) {
-            pos += 1;
-        }
-    }
-
-    // 7. Expect terminal 'u'.
-    if (pos >= buf.len or buf[pos] != 'u') return null;
-    pos += 1;
-
-    return .{
-        .key_code = key_code,
-        .modifiers = mod_raw,
-        .event_type = event_type,
-        .consumed = pos,
-    };
-}
-
-/// Parse a decimal integer from buf starting at pos, advancing pos past the
-/// consumed digits. Returns null if no digits are present.
-fn parseDecimal(buf: []const u8, pos: *usize) ?u32 {
-    const start = pos.*;
-    var value: u32 = 0;
-    while (pos.* < buf.len and std.ascii.isDigit(buf[pos.*])) {
-        value = value *% 10 +% (buf[pos.*] - '0');
-        pos.* += 1;
-    }
-    if (pos.* == start) return null;
-    return value;
-}
-
-/// Detect if the payload contains user input that should be printed to the screen or
-/// is a key combination like up-arrow, backspace, enter, ctrl+f, etc.
-pub fn isUserInput(payload: []const u8) bool {
-    var parser = ghostty_vt.Parser.init();
-    var i: usize = 0;
-    while (i < payload.len) {
-        if (payload[i] == 0x1b and i + 2 < payload.len and payload[i + 1] == '[') {
-            if (parseKittyCsiU(payload[i + 2 ..])) |kitty| {
-                if (kitty.event_type != 3) return true;
-                i += 2 + kitty.consumed;
-                continue;
-            }
-        }
-
-        const actions = parser.next(payload[i]);
-        for (actions) |action_opt| {
-            const action = action_opt orelse continue;
-            switch (action) {
-                .print => return true, // printable characters
-                .csi_dispatch => |csi| {
-                    // kitty keyboard: CSI ... u or CSI ... ~
-                    // legacy modified keys: CSI 27 ; ... ~
-                    // arrow/function keys with modifiers: CSI 1 ; <mod> A-D
-                    if (csi.final == 'u' or csi.final == '~') return true;
-                    // modified arrow keys (e.g., Ctrl+F sends CSI 1;5C in legacy mode)
-                    if (csi.final >= 'A' and csi.final <= 'D' and csi.params.len > 1) return true;
-                    // mouse events: CSI M (basic) or CSI < (SGR extended) - EXCLUDE these
-                    // only intentional keyboard input should trigger leader switch
-                    if (csi.final == 'M' or csi.final == '<') return false;
-                    // focus events: CSI I (focus in) or CSI O (focus out) - EXCLUDE these
-                    // these are automatic terminal events, not user typing
-                    if (csi.final == 'I' or csi.final == 'O') return false;
-                },
-                .execute => |code| {
-                    // looking for CR, LF, tab, and backspace
-                    if (code == 0x0D or code == 0x0A or code == 0x09 or code == 0x08) return true;
-                },
-                else => {},
-            }
-        }
-        i += 1;
-    }
-    return false;
-}
+// Compatibility aliases for existing callers and tests. Classification is
+// implemented entirely in input.zig, which imports only the Zig standard
+// library; raw keyboard bytes never reach Ghostty through these wrappers.
+pub const isCtrlBackslash = input_classifier.isCtrlBackslash;
+pub const isUserInput = input_classifier.isUserInput;
 
 pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
@@ -1008,158 +816,6 @@ test "shellQuote" {
     const plain = try shellQuote(alloc, "hello");
     defer alloc.free(plain);
     try testing.expectEqualStrings("'hello'", plain);
-}
-
-test "isCtrlBackslash" {
-    const expect = testing.expect;
-
-    // Basic: ctrl only (modifier 5 = 1 + 4)
-    try expect(isCtrlBackslash("\x1b[92;5u"));
-
-    // Explicit press event type (:1)
-    try expect(isCtrlBackslash("\x1b[92;5:1u"));
-
-    // Repeat event (:2) -- user holding Ctrl+\
-    try expect(isCtrlBackslash("\x1b[92;5:2u"));
-
-    // Release event (:3) -- must NOT trigger detach
-    try expect(!isCtrlBackslash("\x1b[92;5:3u"));
-
-    // Lock modifiers: caps_lock (bit 6) changes modifier value
-    // ctrl + caps_lock = 1 + (4 + 64) = 69
-    try expect(isCtrlBackslash("\x1b[92;69u"));
-    try expect(isCtrlBackslash("\x1b[92;69:1u"));
-    try expect(!isCtrlBackslash("\x1b[92;69:3u"));
-
-    // ctrl + num_lock = 1 + (4 + 128) = 133
-    try expect(isCtrlBackslash("\x1b[92;133u"));
-
-    // ctrl + caps_lock + num_lock = 1 + (4 + 64 + 128) = 197
-    try expect(isCtrlBackslash("\x1b[92;197u"));
-
-    // Combined intentional modifiers -- must NOT match (ctrl+\ is the
-    // detach key, not ctrl+shift+\ or ctrl+alt+\)
-    // ctrl + shift = 1 + (4 + 1) = 6
-    try expect(!isCtrlBackslash("\x1b[92;6u"));
-
-    // ctrl + alt = 1 + (4 + 2) = 7
-    try expect(!isCtrlBackslash("\x1b[92;7u"));
-
-    // ctrl + super = 1 + (4 + 8) = 13
-    try expect(!isCtrlBackslash("\x1b[92;13u"));
-
-    // ctrl + shift + caps_lock = 1 + (1 + 4 + 64) = 70 -- shift is intentional
-    try expect(!isCtrlBackslash("\x1b[92;70u"));
-
-    // ctrl + shift + num_lock = 1 + (1 + 4 + 128) = 134 -- shift is intentional
-    try expect(!isCtrlBackslash("\x1b[92;134u"));
-
-    // Modifier without ctrl bit -- must NOT match
-    // shift only = 1 + 1 = 2
-    try expect(!isCtrlBackslash("\x1b[92;1u"));
-    try expect(!isCtrlBackslash("\x1b[92;2u"));
-
-    // Alternate key sub-fields (report_alternates flag)
-    // shifted key | (124): \x1b[92:124;5u
-    try expect(isCtrlBackslash("\x1b[92:124;5u"));
-
-    // base layout key only (non-US keyboard): \x1b[92::92;5u
-    try expect(isCtrlBackslash("\x1b[92::92;5u"));
-
-    // both shifted and base layout: \x1b[92:124:92;5u
-    try expect(isCtrlBackslash("\x1b[92:124:92;5u"));
-
-    // Alternate keys + lock modifiers + event type
-    try expect(isCtrlBackslash("\x1b[92:124;69:1u"));
-    try expect(!isCtrlBackslash("\x1b[92:124;69:3u"));
-
-    // Text codepoints section (flag 0b10000) -- tolerated and skipped
-    // Even though ctrl+\ text is typically empty, terminals may vary
-    try expect(isCtrlBackslash("\x1b[92;5;28u"));
-    try expect(isCtrlBackslash("\x1b[92;5;28:92u"));
-
-    // Wrong key code -- must NOT match
-    try expect(!isCtrlBackslash("\x1b[91;5u"));
-    try expect(!isCtrlBackslash("\x1b[93;5u"));
-    try expect(!isCtrlBackslash("\x1b[9;5u"));
-    try expect(!isCtrlBackslash("\x1b[920;5u"));
-
-    // Sequence embedded in larger buffer (e.g., preceded by other input)
-    try expect(isCtrlBackslash("abc\x1b[92;5u"));
-    try expect(isCtrlBackslash("\x1b[A\x1b[92;5u"));
-
-    // Garbage / malformed inputs
-    try expect(!isCtrlBackslash("garbage"));
-    try expect(!isCtrlBackslash(""));
-    try expect(!isCtrlBackslash("\x1b["));
-    try expect(!isCtrlBackslash("\x1b[92"));
-    try expect(!isCtrlBackslash("\x1b[92;"));
-    try expect(!isCtrlBackslash("\x1b[92;u"));
-    try expect(!isCtrlBackslash("\x1b[;5u"));
-
-    // Other CSI u sequences that happen to contain '92' elsewhere
-    try expect(!isCtrlBackslash("\x1b[65;92u"));
-}
-
-test "isCtrlBackslash xterm modifyOtherKeys" {
-    const expect = std.testing.expect;
-
-    // Basic: ctrl only (modifier 5 = 1 + 4), key 92 = '\'
-    // Format: CSI 27 ; <mod> ; <key> ~
-    try expect(isCtrlBackslash("\x1b[27;5;92~"));
-
-    // Lock modifiers tolerated
-    // ctrl + caps_lock = 1 + (4 + 64) = 69
-    try expect(isCtrlBackslash("\x1b[27;69;92~"));
-    // ctrl + num_lock = 1 + (4 + 128) = 133
-    try expect(isCtrlBackslash("\x1b[27;133;92~"));
-    // ctrl + caps_lock + num_lock = 1 + (4 + 64 + 128) = 197
-    try expect(isCtrlBackslash("\x1b[27;197;92~"));
-
-    // Combined intentional modifiers must NOT match
-    // ctrl + shift = 1 + (4 + 1) = 6
-    try expect(!isCtrlBackslash("\x1b[27;6;92~"));
-    // ctrl + alt = 1 + (4 + 2) = 7
-    try expect(!isCtrlBackslash("\x1b[27;7;92~"));
-    // ctrl + super = 1 + (4 + 8) = 13
-    try expect(!isCtrlBackslash("\x1b[27;13;92~"));
-    // ctrl + shift + caps_lock = 1 + (1 + 4 + 64) = 70 -- shift is intentional
-    try expect(!isCtrlBackslash("\x1b[27;70;92~"));
-    // ctrl + shift + num_lock = 1 + (1 + 4 + 128) = 134 -- shift is intentional
-    try expect(!isCtrlBackslash("\x1b[27;134;92~"));
-
-    // Modifier without ctrl bit -- must NOT match
-    try expect(!isCtrlBackslash("\x1b[27;1;92~"));
-    try expect(!isCtrlBackslash("\x1b[27;2;92~"));
-
-    // Wrong key code -- must NOT match
-    try expect(!isCtrlBackslash("\x1b[27;5;91~"));
-    try expect(!isCtrlBackslash("\x1b[27;5;93~"));
-    try expect(!isCtrlBackslash("\x1b[27;5;65~"));
-
-    // Wrong sentinel -- must NOT match
-    try expect(!isCtrlBackslash("\x1b[28;5;92~"));
-    try expect(!isCtrlBackslash("\x1b[26;5;92~"));
-
-    // Wrong terminator -- must NOT match
-    try expect(!isCtrlBackslash("\x1b[27;5;92u"));
-    try expect(!isCtrlBackslash("\x1b[27;5;92m"));
-
-    // CSI sequences that look similar but are not modifyOtherKeys
-    try expect(!isCtrlBackslash("\x1b[27m")); // SGR reset reverse
-    try expect(!isCtrlBackslash("\x1b[27~")); // xterm F4
-    try expect(!isCtrlBackslash("\x1b[27;5R")); // truncated cursor report
-
-    // Sequence embedded in larger buffer
-    try expect(isCtrlBackslash("abc\x1b[27;5;92~"));
-    try expect(isCtrlBackslash("\x1b[A\x1b[27;5;92~"));
-
-    // Garbage / malformed
-    try expect(!isCtrlBackslash("\x1b[27"));
-    try expect(!isCtrlBackslash("\x1b[27;"));
-    try expect(!isCtrlBackslash("\x1b[27;5"));
-    try expect(!isCtrlBackslash("\x1b[27;5;"));
-    try expect(!isCtrlBackslash("\x1b[27;5;92"));
 }
 
 test "serializeTerminalState excludes synchronized output replay" {

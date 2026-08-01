@@ -101,11 +101,11 @@ Run `zmx help` for more information on usage, with examples.
 Usage: zmx <command> [args...]
 
 Commands:
-  [a]ttach <name> [command...]             Attach to session, creating if needed
-  [r]un <name> [-d] [command...]           Send command without attaching
-  [s]end <name> <text...>                  Send raw input to session PTY
+  [a]ttach [--log-input] <name> [command...] Attach to session, creating if needed
+  [r]un [--log-input] <name> [-d] [command...] Send command without attaching
+  [s]end [--log-input] <name> <text...>    Send raw input to session PTY
   [p]rint <name> <text...>                 Inject text into session display
-  [wr]ite <name> <file_path>               Write stdin to file_path through the session
+  [wr]ite [--log-input] <name> <file_path> Write stdin to file_path through the session
   [d]etach                                 Detach all clients (ctrl+\\ for current client)
   [l]ist|ls [--short|--where k=v]          List active sessions
   [g]et <name>                             Get session labels
@@ -120,6 +120,32 @@ Commands:
   [v]ersion                                Show version and metadata (socket dir, log dir)
   [h]elp                                   Show this help
 ```
+
+## input and filesystem security
+
+zmx does not log keyboard or other PTY-bound input by default. To create a
+session that deliberately records its input, put `--log-input` before the
+session name, for example `zmx attach --log-input debug`. That choice is fixed
+for the lifetime of the session. Every later `attach`, `run`, `send`, or
+`write` connection to that session must also include `--log-input` as an
+explicit acknowledgment. The flag never enables logging on an existing
+default session.
+
+Input logs can contain passwords, tokens, pasted data, commands, and file
+contents. zmx prints a warning whenever `--log-input` is used. Existing log
+files may still contain raw input written by older zmx versions; upgrades do
+not delete or scrub historical logs automatically.
+
+The runtime and log directories must be owned by the effective user, must be
+real directories rather than symlinks, and must have mode `0700`. Logs and
+session sockets must likewise be owned by the effective user, non-symlinks of
+the expected type, and mode `0600`. zmx fails closed and prints remediation
+instead of changing insecure existing paths. `ZMX_DIR_MODE` and `ZMX_LOG_MODE`
+are no longer supported and must be unset. The internal session name `logs` is
+reserved. Individual `write` requests are limited to 128 KiB and are accepted
+into the PTY queue atomically. They require `base64`, `printf`, and `wc` in the
+session environment, and success is reported only after the remote shell
+verifies the resulting file size.
 
 ## shell prompt
 
@@ -414,23 +440,25 @@ Each session gets its own unix socket file. The default location depends on your
 
 ## permissions
 
-You can configure the permissions for the socket directory and log files using the following environment variables:
-
-- `ZMX_DIR_MODE` => sets the mode for the socket and log directories (octal, defaults to `0750`)
-- `ZMX_LOG_MODE` => sets the mode for the log files (octal, defaults to `0640`)
-
-This is particularly useful when running `zmx` as a system service with a shared group. For example, setting `ZMX_DIR_MODE=0770` and `ZMX_LOG_MODE=0660` allows group members to attach to the session.
+Runtime and log directories are fixed at `0700`; log files and session sockets
+are fixed at `0600`. Existing paths with different ownership, mode, type, or
+symlink status are rejected with remediation instructions. Group-shared zmx
+directories and sockets are no longer supported. `ZMX_DIR_MODE` and
+`ZMX_LOG_MODE` must be unset.
 
 ## debugging
 
-We store global logs for cli commands in `{log_dir}/zmx.log`. We store session-specific logs in `{log_dir}/{session_name}.log`. Right now they are enabled by default and cannot be disabled. The idea here is to help with initial development until we reach a stable state.
+We store operational CLI logs in `{log_dir}/zmx.log` and session-specific logs
+in `{log_dir}/{session_name}.log`. PTY input contents and per-payload lengths
+are excluded by default. The explicit `--log-input` session policy records
+PTY-bound bytes and may expose secrets; see [input and filesystem security](#input-and-filesystem-security).
 
 The log directory is resolved in this order:
 
 1. `ZMX_DIR/logs` if `ZMX_DIR` is set
 1. `XDG_STATE_HOME/zmx/logs` if `XDG_STATE_HOME` is set
 1. `HOME/.local/state/zmx/logs`
-1. `TMPDIR/zmx-$UID` (or `/tmp/zmx-$UID`) as a last resort
+1. `TMPDIR/zmx-$UID/logs` (or `/tmp/zmx-$UID/logs`) as a last resort
 
 ## a smol contract
 

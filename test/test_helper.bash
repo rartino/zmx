@@ -12,6 +12,7 @@ setup() {
   # Isolate socket dir so tests don't interfere with real sessions or each other
   export ZMX_DIR="$BATS_TEST_TMPDIR/zmx-sockets"
   mkdir -p "$ZMX_DIR"
+  chmod 700 "$ZMX_DIR"
 }
 
 teardown() {

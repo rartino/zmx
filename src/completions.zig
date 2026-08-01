@@ -40,7 +40,11 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|send|print|write|kill|history|get|set|clear|wait|tail)
+    \\    attach|run|send|write)
+    \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
+    \\      COMPREPLY=($(compgen -W "--log-input $sessions" -- "$cur"))
+    \\      ;;
+    \\    print|kill|history|get|set|clear|wait|tail|--log-input)
     \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -65,6 +69,7 @@ const zsh_completions =
     \\  typeset -A opt_args
     \\
     \\  _arguments -C \
+    \\    '--log-input[Acknowledge immutable session input logging policy]' \
     \\    '1: :->commands' \
     \\    '2: :->args' \
     \\    '*: :->trailing' \
@@ -160,6 +165,7 @@ const fish_completions =
     \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish nu' -d Shell
     \\
     \\# Subcommand flags
+    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run s send wr write" -l log-input -d 'Acknowledge immutable session input logging policy'
     \\complete -c zmx -n "__fish_seen_subcommand_from r run" -s d -d 'Detach from the calling terminal; use `wait` to track its status'
     \\complete -c zmx -n "__fish_seen_subcommand_from r run" -l fish -d 'Required when the session runs fish shell'
     \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l short -d 'Short output'
@@ -179,11 +185,13 @@ const nu_completions =
     \\}
     \\
     \\export extern "zmx attach" [
+    \\    --log-input
     \\    name: string@"nu-complete zmx sessions"
     \\    ...rest: string
     \\]
     \\
     \\export extern "zmx run" [
+    \\    --log-input
     \\    name: string@"nu-complete zmx sessions"
     \\    -d
     \\    --fish
@@ -191,6 +199,7 @@ const nu_completions =
     \\]
     \\
     \\export extern "zmx send" [
+    \\    --log-input
     \\    name: string@"nu-complete zmx sessions"
     \\    text: string
     \\]
@@ -201,6 +210,7 @@ const nu_completions =
     \\]
     \\
     \\export extern "zmx write" [
+    \\    --log-input
     \\    name: string@"nu-complete zmx sessions"
     \\    path: path
     \\]

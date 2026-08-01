@@ -2,6 +2,10 @@ const std = @import("std");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const lib_posix = @import("posix.zig");
+const test_c = if (@import("builtin").is_test) @cImport({
+    @cInclude("sys/socket.h");
+    @cInclude("unistd.h");
+}) else struct {};
 
 pub const Tag = enum(u8) {
     Input = 0,
@@ -23,15 +27,17 @@ pub const Tag = enum(u8) {
     LabelClear = 16,
     LabelData = 17,
     Send = 18,
-    // Non-exhaustive: this enum comes off the wire via bytesToValue and
-    // @enumFromInt, so out-of-range values are representable
-    // rather than UB. Switches must handle `_` (unknown tag).
+    InputPolicy = 19,
+    InputPolicyMismatch = 20,
+    RequestRejected = 21,
+    // Non-exhaustive because this enum comes from untrusted wire bytes.
+    // Switches must safely handle `_` (unknown tag).
     _,
 };
 
 comptime {
     if (@typeInfo(Tag).@"enum".is_exhaustive) @compileError(
-        "ipc.Tag must stay non-exhaustive -- old daemons rely on `_` to ignore unknown tags",
+        "ipc.Tag must stay non-exhaustive so unknown wire tags are safely ignored",
     );
 }
 
@@ -47,6 +53,40 @@ pub const Resize = packed struct {
     ypixel: u16 = 0,
 };
 
+pub const InputPolicy = packed struct {
+    log_input: u8,
+
+    pub fn init(log_input: bool) InputPolicy {
+        return .{ .log_input = @intFromBool(log_input) };
+    }
+
+    pub fn value(self: InputPolicy) ?bool {
+        return switch (self.log_input) {
+            0 => false,
+            1 => true,
+            else => null,
+        };
+    }
+};
+
+pub const SwitchTarget = struct {
+    log_input: bool,
+    name: []const u8,
+};
+
+/// Switch wire payload: one policy byte followed by the canonical target
+/// name. The policy is carried so the receiving terminal can acknowledge the
+/// target daemon correctly; it does not alter either daemon.
+pub fn parseSwitchTarget(payload: []const u8) !SwitchTarget {
+    if (payload.len < 2) return error.InvalidSwitchTarget;
+    const log_input = switch (payload[0]) {
+        0 => false,
+        1 => true,
+        else => return error.InvalidSwitchTarget,
+    };
+    return .{ .log_input = log_input, .name = payload[1..] };
+}
+
 pub fn getTerminalSize(fd: i32) Resize {
     var ws: cross.c.struct_winsize = undefined;
     if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
@@ -57,10 +97,33 @@ pub fn getTerminalSize(fd: i32) Resize {
 
 pub const MAX_CMD_LEN = 256;
 pub const MAX_CWD_LEN = 256;
+pub const MAX_WRITE_CONTENT_LEN = 128 * 1024;
+pub const MAX_WRITE_PATH_LEN = 4096;
 
-/// Frozen wire shape. Do NOT add fields! New stats go in new `Tag` values
-/// so old daemons (whose `_` arm ignores unknown tags) stay reachable.
-/// Changing `@sizeOf(Info)` breaks `zmx list` against running daemons.
+/// Upper bounds keep one malformed local stream from growing a parser until
+/// memory exhaustion. Write and History are intentionally larger than normal
+/// control/input frames because those commands carry file and scrollback data.
+pub fn maxPayloadLen(tag: Tag) usize {
+    return switch (tag) {
+        .History, .Output => 64 * 1024 * 1024,
+        .Write => @sizeOf(u32) + MAX_WRITE_PATH_LEN + MAX_WRITE_CONTENT_LEN,
+        else => 1024 * 1024,
+    };
+}
+
+/// Frames received by a daemon are commands from a local client. They never
+/// need the large History/Output response allowance used in the opposite
+/// direction. Keep this limit separate so a peer cannot turn one large input
+/// frame into a copy for every attached terminal.
+pub fn maxClientPayloadLen(tag: Tag) usize {
+    return switch (tag) {
+        .Write => @sizeOf(u32) + MAX_WRITE_PATH_LEN + MAX_WRITE_CONTENT_LEN,
+        else => 1024 * 1024,
+    };
+}
+
+/// Frozen wire shape. Do NOT add fields; new stats use new `Tag` values.
+/// This is an internal invariant for peers built from the same source.
 pub const Info = extern struct {
     clients_len: u64,
     pid: i32,
@@ -82,6 +145,7 @@ pub fn expectedLength(data: []const u8) ?usize {
 }
 
 pub fn send(fd: i32, tag: Tag, data: []const u8) !void {
+    if (data.len > maxPayloadLen(tag)) return error.FrameTooLarge;
     const header = Header{
         .tag = tag,
         .len = @intCast(data.len),
@@ -99,6 +163,7 @@ pub fn appendMessage(
     tag: Tag,
     data: []const u8,
 ) !void {
+    if (data.len > maxPayloadLen(tag)) return error.FrameTooLarge;
     const header = Header{
         .tag = tag,
         .len = @intCast(data.len),
@@ -138,15 +203,30 @@ pub const SocketMsg = struct {
 };
 
 pub const SocketBuffer = struct {
+    const Peer = enum { client, daemon };
+
     buf: std.ArrayList(u8),
     alloc: std.mem.Allocator,
     head: usize,
+    peer: Peer,
 
     pub fn init(alloc: std.mem.Allocator) !SocketBuffer {
+        return initForPeer(alloc, .client);
+    }
+
+    /// Initialize a buffer for responses sent by a trusted session daemon.
+    /// History and terminal restoration can legitimately exceed command-size
+    /// limits, while daemon ingress remains capped by `init` above.
+    pub fn initFromDaemon(alloc: std.mem.Allocator) !SocketBuffer {
+        return initForPeer(alloc, .daemon);
+    }
+
+    fn initForPeer(alloc: std.mem.Allocator, peer: Peer) !SocketBuffer {
         return .{
             .buf = try std.ArrayList(u8).initCapacity(alloc, 4096),
             .alloc = alloc,
             .head = 0,
+            .peer = peer,
         };
     }
 
@@ -170,12 +250,26 @@ pub const SocketBuffer = struct {
             self.head = 0;
         }
 
+        try self.validatePendingHeader();
+
         var tmp: [4096]u8 = undefined;
         const n = try lib_posix.read(fd, &tmp);
         if (n > 0) {
             try self.buf.appendSlice(self.alloc, tmp[0..n]);
+            try self.validatePendingHeader();
         }
         return n;
+    }
+
+    fn validatePendingHeader(self: *const SocketBuffer) !void {
+        const available = self.buf.items[self.head..];
+        if (available.len < @sizeOf(Header)) return;
+        const header = std.mem.bytesToValue(Header, available[0..@sizeOf(Header)]);
+        const limit = switch (self.peer) {
+            .client => maxClientPayloadLen(header.tag),
+            .daemon => maxPayloadLen(header.tag),
+        };
+        if (@as(usize, header.len) > limit) return error.FrameTooLarge;
     }
 
     /// Returns the next complete message or `null` when none available.
@@ -206,6 +300,75 @@ pub fn connectSession(socket_path: []const u8) ConnectError!i32 {
         error.ConnectionRefused => return error.ConnectionRefused,
         else => return error.Unexpected,
     };
+}
+
+/// Declare and confirm the immutable input-logging policy before this
+/// connection sends any PTY-bound data. This is policy enforcement, not
+/// protocol negotiation: all peers are expected to run the same build.
+pub fn acknowledgeInputPolicy(
+    alloc: std.mem.Allocator,
+    fd: i32,
+    log_input: bool,
+) !SocketBuffer {
+    const policy = InputPolicy.init(log_input);
+    try send(fd, .InputPolicy, std.mem.asBytes(&policy));
+
+    var read_buf = try SocketBuffer.initFromDaemon(alloc);
+    errdefer read_buf.deinit();
+
+    while (true) {
+        var header: Header = undefined;
+        try readPolicyBytes(fd, std.mem.asBytes(&header));
+        const payload_len: usize = @intCast(header.len);
+
+        // Policy responses and any raced PTY Output frames are small. Refuse
+        // an implausible peer frame instead of allocating an attacker-chosen
+        // u32-sized buffer during the mandatory handshake.
+        if (payload_len > 1024 * 1024) return error.InputPolicyFrameTooLarge;
+
+        switch (header.tag) {
+            .Ack => {
+                if (payload_len != 0) return error.InvalidInputPolicyAck;
+                // Reads above are exact-size, so bytes belonging to a frame
+                // after Ack remain in the socket for the caller's normal
+                // SocketBuffer. No partial frame can be stranded here.
+                return read_buf;
+            },
+            .InputPolicyMismatch => {
+                var discard: [1024]u8 = undefined;
+                var remaining = payload_len;
+                while (remaining > 0) {
+                    const amount = @min(remaining, discard.len);
+                    try readPolicyBytes(fd, discard[0..amount]);
+                    remaining -= amount;
+                }
+                return error.InputPolicyMismatch;
+            },
+            else => {
+                try read_buf.buf.appendSlice(alloc, std.mem.asBytes(&header));
+                const old_len = read_buf.buf.items.len;
+                try read_buf.buf.resize(alloc, old_len + payload_len);
+                try readPolicyBytes(fd, read_buf.buf.items[old_len..]);
+            },
+        }
+    }
+}
+
+fn readPolicyBytes(fd: i32, dest: []u8) !void {
+    var offset: usize = 0;
+    while (offset < dest.len) {
+        var poll_fds = [_]lib_posix.pollfd{.{ .fd = fd, .events = lib_posix.POLL.IN, .revents = 0 }};
+        const poll_result = try lib_posix.poll(&poll_fds, 1000);
+        if (poll_result == 0) return error.InputPolicyTimeout;
+        if (poll_fds[0].revents & lib_posix.POLL.IN == 0 and
+            poll_fds[0].revents & (lib_posix.POLL.HUP | lib_posix.POLL.ERR | lib_posix.POLL.NVAL) != 0)
+        {
+            return error.ConnectionClosed;
+        }
+        const n = try lib_posix.read(fd, dest[offset..]);
+        if (n == 0) return error.ConnectionClosed;
+        offset += n;
+    }
 }
 
 const SessionProbeError = error{
@@ -244,7 +407,7 @@ pub fn probeSession(
         return error.Timeout;
     }
 
-    var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
+    var sb = SocketBuffer.initFromDaemon(alloc) catch return error.Unexpected;
     defer sb.deinit();
 
     const n = sb.read(fd) catch return error.Unexpected;
@@ -288,8 +451,8 @@ pub fn probeSession(
 
 //  WIRE PROTOCOL FREEZE: read before "fixing" any test below.
 //
-//  Changing these constants does not fix the test; it breaks every
-//  running daemon for every user until they `pkill -f zmx`.
+//  Changing these constants does not fix the test; it violates the
+//  same-build wire contract between clients and session daemons.
 //
 //  Need a new field?   → add a new `Tag` value (next free integer).
 //  Need to remove one? → don't. Reserve the integer, stop sending it.
@@ -301,14 +464,98 @@ test "Info wire size is frozen" {
 
 test "Tag wire values are frozen" {
     inline for (.{
-        .{ Tag.Input, 0 },     .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
-        .{ Tag.Detach, 3 },    .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
-        .{ Tag.Info, 6 },      .{ Tag.Init, 7 },          .{ Tag.History, 8 },
-        .{ Tag.Run, 9 },       .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
-        .{ Tag.Write, 12 },    .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
-        .{ Tag.LabelSet, 15 }, .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
-        .{ Tag.Send, 18 },
+        .{ Tag.Input, 0 },            .{ Tag.Output, 1 },        .{ Tag.Resize, 2 },
+        .{ Tag.Detach, 3 },           .{ Tag.DetachAll, 4 },     .{ Tag.Kill, 5 },
+        .{ Tag.Info, 6 },             .{ Tag.Init, 7 },          .{ Tag.History, 8 },
+        .{ Tag.Run, 9 },              .{ Tag.Ack, 10 },          .{ Tag.Switch, 11 },
+        .{ Tag.Write, 12 },           .{ Tag.TaskComplete, 13 }, .{ Tag.LabelGet, 14 },
+        .{ Tag.LabelSet, 15 },        .{ Tag.LabelClear, 16 },   .{ Tag.LabelData, 17 },
+        .{ Tag.Send, 18 },            .{ Tag.InputPolicy, 19 },  .{ Tag.InputPolicyMismatch, 20 },
+        .{ Tag.RequestRejected, 21 },
     }) |p| try std.testing.expectEqual(@as(u8, p[1]), @intFromEnum(p[0]));
+}
+
+test "input logging policy defaults are explicit booleans" {
+    try std.testing.expectEqual(@as(?bool, false), InputPolicy.init(false).value());
+    try std.testing.expectEqual(@as(?bool, true), InputPolicy.init(true).value());
+    try std.testing.expectEqual(@as(?bool, null), (InputPolicy{ .log_input = 2 }).value());
+}
+
+test "policy acknowledgement preserves preceding frames without consuming following bytes" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), test_c.socketpair(test_c.AF_UNIX, test_c.SOCK_STREAM, 0, &fds));
+    defer _ = test_c.close(fds[0]);
+    defer _ = test_c.close(fds[1]);
+
+    try send(fds[1], .Output, "startup");
+    try send(fds[1], .Ack, "");
+    const following = Header{ .tag = .Output, .len = 3 };
+    const following_bytes = std.mem.asBytes(&following);
+    try writeAll(fds[1], following_bytes[0..2]);
+
+    var pending = try acknowledgeInputPolicy(std.testing.allocator, fds[0], false);
+    defer pending.deinit();
+    const output = pending.next().?;
+    try std.testing.expectEqual(Tag.Output, output.header.tag);
+    try std.testing.expectEqualStrings("startup", output.payload);
+    try std.testing.expect(pending.next() == null);
+
+    var unread: [2]u8 = undefined;
+    try readPolicyBytes(fds[0], &unread);
+    try std.testing.expectEqualSlices(u8, following_bytes[0..2], &unread);
+}
+
+test "socket buffer rejects an oversized declared frame before payload allocation" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), test_c.socketpair(test_c.AF_UNIX, test_c.SOCK_STREAM, 0, &fds));
+    defer _ = test_c.close(fds[0]);
+    defer _ = test_c.close(fds[1]);
+
+    const oversized = Header{
+        .tag = .Input,
+        .len = @intCast(maxPayloadLen(.Input) + 1),
+    };
+    try writeAll(fds[1], std.mem.asBytes(&oversized));
+
+    var buffer = try SocketBuffer.init(std.testing.allocator);
+    defer buffer.deinit();
+    try std.testing.expectError(error.FrameTooLarge, buffer.read(fds[0]));
+}
+
+test "socket buffer applies direction-aware Output limits" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), test_c.socketpair(test_c.AF_UNIX, test_c.SOCK_STREAM, 0, &fds));
+    defer _ = test_c.close(fds[0]);
+    defer _ = test_c.close(fds[1]);
+
+    const large_output = Header{
+        .tag = .Output,
+        .len = @intCast(maxClientPayloadLen(.Output) + 1),
+    };
+    try writeAll(fds[1], std.mem.asBytes(&large_output));
+
+    var daemon_ingress = try SocketBuffer.init(std.testing.allocator);
+    defer daemon_ingress.deinit();
+    try std.testing.expectError(error.FrameTooLarge, daemon_ingress.read(fds[0]));
+
+    var response_buf = try SocketBuffer.initFromDaemon(std.testing.allocator);
+    defer response_buf.deinit();
+    try response_buf.buf.appendSlice(std.testing.allocator, std.mem.asBytes(&large_output));
+    try response_buf.validatePendingHeader();
+}
+
+test "switch target carries policy and rejects malformed payloads" {
+    const off = try parseSwitchTarget("\x00dev");
+    try std.testing.expect(!off.log_input);
+    try std.testing.expectEqualStrings("dev", off.name);
+
+    const on = try parseSwitchTarget("\x01nested.dev");
+    try std.testing.expect(on.log_input);
+    try std.testing.expectEqualStrings("nested.dev", on.name);
+
+    try std.testing.expectError(error.InvalidSwitchTarget, parseSwitchTarget(""));
+    try std.testing.expectError(error.InvalidSwitchTarget, parseSwitchTarget("\x00"));
+    try std.testing.expectError(error.InvalidSwitchTarget, parseSwitchTarget("\x02dev"));
 }
 
 pub fn roundTripForTag(
@@ -328,7 +575,7 @@ pub fn roundTripForTag(
     const poll_result = lib_posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
     if (poll_result == 0) return error.Timeout;
 
-    var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
+    var sb = SocketBuffer.initFromDaemon(alloc) catch return error.Unexpected;
     defer sb.deinit();
 
     const n = sb.read(fd) catch return error.Unexpected;
