@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
 
     const log_path = try std.fs.path.join(gpa, &.{ cfg.log_dir, "zmx.log" });
     defer gpa.free(log_path);
-    try log.log_system.init(io, log_path);
+    try log.log_system.init(io, log_path, cfg.log_mode, cfg.log_owner);
     defer log.log_system.deinit();
 
     const shell_env = init.environ_map.get("SHELL") orelse "/bin/sh";
@@ -273,7 +273,7 @@ pub fn main(init: std.process.Init) !void {
         if (matchers.items.len == 0) {
             return error.SessionNameRequired;
         }
-        var sessions = try util.get_session_entries(gpa, io, cfg.socket_dir);
+        var sessions = try util.get_session_entries(gpa, io, cfg.socket_dir, cfg.socket_mode, cfg.socket_owner);
         defer {
             for (sessions.items) |session| {
                 session.deinit(gpa);
@@ -353,7 +353,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (any_prefix) {
-            var sessions = try util.get_session_entries(gpa, io, cfg.socket_dir);
+            var sessions = try util.get_session_entries(gpa, io, cfg.socket_dir, cfg.socket_mode, cfg.socket_owner);
             defer {
                 for (sessions.items) |session| {
                     session.deinit(gpa);
@@ -389,7 +389,7 @@ pub fn main(init: std.process.Init) !void {
                 error.NameTooLong => return socket.printSessionNameTooLong(init.io, session_name, cfg.socket_dir),
                 error.OutOfMemory => return err,
             };
-            const client_sock = try socket.sessionConnect(socket_path);
+            const client_sock = try socket.sessionConnect(socket_path, cfg.socket_mode, cfg.socket_owner);
             try client_socket_fds.append(gpa, client_sock);
         }
         _ = try tail(gpa, client_socket_fds, false, false);
@@ -571,8 +571,9 @@ fn help(io: std.Io) !void {
         \\  TMPDIR               Socket directory (priority 3)
         \\  ZMX_SESSION          Session name (injected automatically)
         \\  ZMX_SESSION_PREFIX   Prefix added to all session names
-        \\  ZMX_DIR_MODE         Unsupported; unset it (directories are always 0700)
-        \\  ZMX_LOG_MODE         Unsupported; unset it (logs are always 0600)
+        \\  ZMX_DIR_MODE         Octal runtime/log directory mode (default: 0700)
+        \\                       Socket mode is ZMX_DIR_MODE with execute bits removed
+        \\  ZMX_LOG_MODE         Octal operational/session log mode (default: 0600)
         \\
     ;
     var buf: [8192]u8 = undefined;
@@ -797,7 +798,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
     var prev_done: i32 = 0;
     while (true) {
         agg_exit_code = 0;
-        var sessions = try util.get_session_entries(alloc, io, cfg.socket_dir);
+        var sessions = try util.get_session_entries(alloc, io, cfg.socket_dir, cfg.socket_mode, cfg.socket_owner);
         var total: i32 = 0;
         var done: i32 = 0;
 
@@ -906,7 +907,7 @@ fn wait(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, matchers: std.ArrayList
     }
     try stdout.flush();
 
-    const sessions = try util.get_session_entries(alloc, io, cfg.socket_dir);
+    const sessions = try util.get_session_entries(alloc, io, cfg.socket_dir, cfg.socket_mode, cfg.socket_owner);
     for (sessions.items) |session| {
         var found = false;
         for (matchers.items) |m| {
@@ -963,7 +964,7 @@ fn list(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, short: bool) !void {
     const current_session = socket.getSeshNameFromEnv();
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
-    var sessions = try util.get_session_entries(alloc, io, cfg.socket_dir);
+    var sessions = try util.get_session_entries(alloc, io, cfg.socket_dir, cfg.socket_mode, cfg.socket_owner);
     defer {
         for (sessions.items) |session| {
             session.deinit(alloc);
@@ -1010,9 +1011,9 @@ fn detachAll(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg) !void {
         error.OutOfMemory => return err,
     };
     defer alloc.free(socket_path);
-    const fd = ipc.connectSession(socket_path) catch |err| {
+    const fd = ipc.connectSession(socket_path, cfg.socket_mode, cfg.socket_owner) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
-        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(io, dir, cfg.socket_dir, session_name);
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(io, dir, cfg.socket_dir, session_name, cfg.socket_mode, cfg.socket_owner);
         return;
     };
     defer lib_posix.close(fd);
@@ -1033,7 +1034,7 @@ fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
     var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
     defer dir.close(io);
 
-    const exists = try socket.sessionExists(io, dir, cfg.socket_dir, session_name);
+    const exists = try socket.sessionExists(io, dir, cfg.socket_dir, session_name, cfg.socket_mode, cfg.socket_owner);
     if (!exists) {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &buf);
@@ -1041,12 +1042,12 @@ fn kill(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []const u
         w.interface.flush() catch {};
         return error.SessionNotFound;
     }
-    const fd = ipc.connectSession(socket_path) catch |err| {
+    const fd = ipc.connectSession(socket_path, cfg.socket_mode, cfg.socket_owner) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stdout().writer(io, &buf);
         if (force or err == error.ConnectionRefused) {
-            socket.cleanupStaleSocket(io, dir, cfg.socket_dir, session_name);
+            socket.cleanupStaleSocket(io, dir, cfg.socket_dir, session_name, cfg.socket_mode, cfg.socket_owner);
             w.interface.print("cleaned up stale session {s}\n", .{session_name}) catch {};
         } else {
             w.interface.print(
@@ -1111,7 +1112,7 @@ fn labelGet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []con
     };
     defer alloc.free(socket_path);
 
-    const payload = ipc.roundTripForTag(alloc, socket_path, .LabelGet, "", .LabelData) catch |err| {
+    const payload = ipc.roundTripForTag(alloc, socket_path, cfg.socket_mode, cfg.socket_owner, .LabelGet, "", .LabelData) catch |err| {
         printLabelError(io, session_name, err);
     };
     defer alloc.free(payload);
@@ -1163,7 +1164,7 @@ fn labelSet(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []con
     };
     defer alloc.free(socket_path);
 
-    _ = ipc.roundTripForTag(alloc, socket_path, .LabelSet, labels, .Ack) catch |err| {
+    _ = ipc.roundTripForTag(alloc, socket_path, cfg.socket_mode, cfg.socket_owner, .LabelSet, labels, .Ack) catch |err| {
         printLabelError(io, session_name, err);
     };
 }
@@ -1177,7 +1178,7 @@ fn labelClear(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []c
     };
     defer alloc.free(socket_path);
 
-    _ = ipc.roundTripForTag(alloc, socket_path, .LabelClear, "", .Ack) catch |err| {
+    _ = ipc.roundTripForTag(alloc, socket_path, cfg.socket_mode, cfg.socket_owner, .LabelClear, "", .Ack) catch |err| {
         printLabelError(io, session_name, err);
     };
 }
@@ -1203,13 +1204,13 @@ fn fetchHistory(
     var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
     defer dir.close(io);
 
-    const exists = try socket.sessionExists(io, dir, cfg.socket_dir, session_name);
+    const exists = try socket.sessionExists(io, dir, cfg.socket_dir, session_name, cfg.socket_mode, cfg.socket_owner);
     if (!exists) {
         return error.SessionNotFound;
     }
 
-    const fd = ipc.connectSession(socket_path) catch |err| {
-        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(io, dir, cfg.socket_dir, session_name);
+    const fd = ipc.connectSession(socket_path, cfg.socket_mode, cfg.socket_owner) catch |err| {
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(io, dir, cfg.socket_dir, session_name, cfg.socket_mode, cfg.socket_owner);
         return err;
     };
     defer lib_posix.close(fd);
@@ -1260,7 +1261,7 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
     var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
     defer dir.close(io);
 
-    const exists = try socket.sessionExists(io, dir, cfg.socket_dir, session_name);
+    const exists = try socket.sessionExists(io, dir, cfg.socket_dir, session_name, cfg.socket_mode, cfg.socket_owner);
     if (!exists) {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &buf);
@@ -1268,9 +1269,9 @@ fn history(alloc: std.mem.Allocator, io: std.Io, cfg: *Cfg, session_name: []cons
         w.interface.flush() catch {};
         return error.SessionNotFound;
     }
-    const fd = ipc.connectSession(socket_path) catch |err| {
+    const fd = ipc.connectSession(socket_path, cfg.socket_mode, cfg.socket_owner) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
-        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(io, dir, cfg.socket_dir, session_name);
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(io, dir, cfg.socket_dir, session_name, cfg.socket_mode, cfg.socket_owner);
         return;
     };
     defer lib_posix.close(fd);
@@ -1321,7 +1322,7 @@ fn switchSesh(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, current_sesh:
     var dir = try std.Io.Dir.openDirAbsolute(io, daemon.cfg.socket_dir, .{});
     defer dir.close(io);
 
-    const exists = try socket.sessionExists(io, dir, daemon.cfg.socket_dir, current_sesh);
+    const exists = try socket.sessionExists(io, dir, daemon.cfg.socket_dir, current_sesh, daemon.cfg.socket_mode, daemon.cfg.socket_owner);
     if (!exists) {
         var buf: [4096]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &buf);
@@ -1329,9 +1330,9 @@ fn switchSesh(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, current_sesh:
         w.interface.flush() catch {};
         return error.SessionNotFound;
     }
-    const fd = ipc.connectSession(socket_path) catch |err| {
+    const fd = ipc.connectSession(socket_path, daemon.cfg.socket_mode, daemon.cfg.socket_owner) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
-        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(io, dir, daemon.cfg.socket_dir, current_sesh);
+        if (err == error.ConnectionRefused) socket.cleanupStaleSocket(io, dir, daemon.cfg.socket_dir, current_sesh, daemon.cfg.socket_mode, daemon.cfg.socket_owner);
         return;
     };
     defer lib_posix.close(fd);
@@ -1376,7 +1377,7 @@ fn attachCanonical(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon) !void {
         const is_daemon_proc = try active.ensureSession(io);
         if (is_daemon_proc) return;
 
-        const client_sock = try socket.sessionConnect(active.socket_path);
+        const client_sock = try socket.sessionConnect(active.socket_path, active.cfg.socket_mode, active.cfg.socket_owner);
         std.log.info("attached session={s}", .{active.session_name});
         const looper = try attachClient(gpa, io, client_sock, active.cfg.socket_dir, active.log_input);
         if (looper.kind == .detach) return;
@@ -1498,10 +1499,10 @@ fn writeFile(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, file_path: []c
     var dir = try std.Io.Dir.openDirAbsolute(io, daemon.cfg.socket_dir, .{});
     defer dir.close(io);
 
-    const client_fd = ipc.connectSession(socket_path) catch |err| {
+    const client_fd = ipc.connectSession(socket_path, daemon.cfg.socket_mode, daemon.cfg.socket_owner) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         if (err == error.ConnectionRefused) {
-            socket.cleanupStaleSocket(io, dir, daemon.cfg.socket_dir, daemon.session_name);
+            socket.cleanupStaleSocket(io, dir, daemon.cfg.socket_dir, daemon.session_name, daemon.cfg.socket_mode, daemon.cfg.socket_owner);
             w.interface.print("cleaned up stale session {s}\n", .{daemon.session_name}) catch {};
         } else {
             w.interface.print(
@@ -1604,10 +1605,10 @@ fn send(
     var dir = try std.Io.Dir.openDirAbsolute(io, cfg.socket_dir, .{});
     defer dir.close(io);
 
-    const client_fd = ipc.connectSession(socket_path) catch |err| {
+    const client_fd = ipc.connectSession(socket_path, cfg.socket_mode, cfg.socket_owner) catch |err| {
         std.log.err("session unresponsive: {s}", .{@errorName(err)});
         if (err == error.ConnectionRefused) {
-            socket.cleanupStaleSocket(io, dir, cfg.socket_dir, session_name);
+            socket.cleanupStaleSocket(io, dir, cfg.socket_dir, session_name, cfg.socket_mode, cfg.socket_owner);
             try w.interface.print("cleaned up stale session {s}\n", .{session_name});
         } else {
             try w.interface.print(
@@ -1697,7 +1698,7 @@ fn run(gpa: std.mem.Allocator, io: std.Io, daemon: *Daemon, detached: bool, comm
         return error.CommandRequired;
     }
 
-    const client_sock = ipc.connectSession(daemon.socket_path) catch |err| {
+    const client_sock = ipc.connectSession(daemon.socket_path, daemon.cfg.socket_mode, daemon.cfg.socket_owner) catch |err| {
         std.log.err("session not ready: {s}", .{@errorName(err)});
         return error.SessionNotReady;
     };

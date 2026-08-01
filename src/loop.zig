@@ -870,12 +870,12 @@ pub const Daemon = struct {
         var dir = try std.Io.Dir.openDirAbsolute(io, self.cfg.socket_dir, .{});
         defer dir.close(io);
 
-        const exists = try socket.sessionExists(io, dir, self.cfg.socket_dir, sesh_name);
+        const exists = try socket.sessionExists(io, dir, self.cfg.socket_dir, sesh_name, self.cfg.socket_mode, self.cfg.socket_owner);
         // if daemon is gone then we flip this to true
         var should_create = !exists;
 
         if (exists) {
-            if (ipc.connectSession(self.socket_path)) |fd| {
+            if (ipc.connectSession(self.socket_path, self.cfg.socket_mode, self.cfg.socket_owner)) |fd| {
                 lib_posix.close(fd);
                 if (self.command != null) {
                     std.log.warn(
@@ -886,7 +886,7 @@ pub const Daemon = struct {
             } else |err| switch (err) {
                 // Daemon is definitively gone: safe to replace.
                 error.ConnectionRefused => {
-                    socket.cleanupStaleSocket(io, dir, self.cfg.socket_dir, sesh_name);
+                    socket.cleanupStaleSocket(io, dir, self.cfg.socket_dir, sesh_name, self.cfg.socket_mode, self.cfg.socket_owner);
                     should_create = true;
                 },
                 // Connect failed for an unusual reason. The check is only to
@@ -926,9 +926,9 @@ pub const Daemon = struct {
             session_log_path_fba.allocator(),
             &.{ self.cfg.log_dir, session_log_name },
         );
-        try log.preflight(io, session_log_path);
+        try log.preflight(io, session_log_path, self.cfg.log_mode, self.cfg.log_owner);
 
-        const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path);
+        const server_sock_fd: lib_posix.socket_t = try socket.createSocket(self.socket_path, self.cfg.socket_mode, self.cfg.socket_owner);
         const log_fd = log.log_system.file.?.handle;
 
         var keep_fds_open = [_]i32{ server_sock_fd, dir.handle, log_fd };
@@ -998,7 +998,7 @@ pub const Daemon = struct {
         // Keep both buffers alive for the full daemon loop: LogSystem retains
         // the path for secure rotation/reopen operations.
         log.log_system.deinit();
-        try log.log_system.init(new_io, session_log_path);
+        try log.log_system.init(new_io, session_log_path, self.cfg.log_mode, self.cfg.log_owner);
 
         self.io = new_io;
         try daemonLoop(self, gpa, new_io, server_sock_fd, pty_info.master_fd);

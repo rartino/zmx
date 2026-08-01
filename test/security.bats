@@ -58,7 +58,7 @@ mode_of() {
   run env ZMX_DIR="$insecure" "$ZMX" list --short
   [ "$status" -ne 0 ]
   [[ "$output" == *"chmod 700"* ]]
-  [[ "$output" == *"chown"* ]]
+  [[ "$output" == *"intended service owner/group"* ]]
   [ "$(mode_of "$insecure")" = 755 ]
 
   run env ZMX_DIR="$insecure/" "$ZMX" list --short
@@ -82,14 +82,157 @@ mode_of() {
   [ -f "$wrong" ]
 }
 
-@test "removed mode environment variables fail clearly" {
-  run env ZMX_DIR_MODE=700 "$ZMX" list --short
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"ZMX_DIR_MODE"* ]]
+@test "custom modes apply under umask and existing configured modes are accepted" {
+  local shared="$BATS_TEST_TMPDIR/shared"
+  run env ZMX_DIR="$shared" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 \
+    sh -c 'umask 077; exec "$1" list --short' sh "$ZMX"
+  [ "$status" -eq 0 ]
+  [ "$(mode_of "$shared")" = 770 ]
+  [ "$(mode_of "$shared/logs")" = 770 ]
+  [ "$(mode_of "$shared/logs/zmx.log")" = 660 ]
 
-  run env ZMX_LOG_MODE=600 "$ZMX" list --short
+  run env ZMX_DIR="$shared" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 "$ZMX" list --short
+  [ "$status" -eq 0 ]
+
+  env ZMX_DIR="$shared" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 \
+    "$ZMX" run shared-mode -d true
+  wait_for_shared_session() {
+    local i=0
+    while (( i < 50 )); do
+      env ZMX_DIR="$shared" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 \
+        "$ZMX" list --short 2>/dev/null | grep -qx shared-mode && return 0
+      sleep 0.1
+      (( i++ )) || true
+    done
+    return 1
+  }
+  wait_for_shared_session
+  [ "$(mode_of "$shared/shared-mode")" = 660 ]
+  [ "$(mode_of "$shared/logs/shared-mode.log")" = 660 ]
+
+  env ZMX_DIR="$shared" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 \
+    "$ZMX" kill --force shared-mode
+}
+
+@test "custom modes do not widen missing non-zmx ancestors" {
+  local root="$BATS_TEST_TMPDIR/nested-parents"
+  mkdir -p "$root"
+  chmod 700 "$root"
+
+  run env -u ZMX_DIR \
+    XDG_RUNTIME_DIR="$root/runtime" XDG_STATE_HOME="$root/state" \
+    ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 "$ZMX" list --short
+  [ "$status" -eq 0 ]
+
+  [ "$(mode_of "$root/runtime")" = 700 ]
+  [ "$(mode_of "$root/runtime/zmx")" = 770 ]
+  [ "$(mode_of "$root/state")" = 700 ]
+  [ "$(mode_of "$root/state/zmx")" = 700 ]
+  [ "$(mode_of "$root/state/zmx/logs")" = 770 ]
+  [ "$(mode_of "$root/state/zmx/logs/zmx.log")" = 660 ]
+}
+
+@test "different-uid members of the configured service group can use owner-created sessions" {
+  [ "$(id -u)" -eq 0 ] || skip "requires root to exercise distinct effective UIDs"
+  command -v setpriv >/dev/null 2>&1 || skip "requires setpriv"
+
+  local shared="$BATS_TEST_TMPDIR/cross-uid"
+  local service_uid=42001 client_uid=42002 shared_gid=42000
+  chmod 755 "$BATS_TEST_TMPDIR"
+  mkdir -p "$shared/logs"
+  chown "$service_uid:$shared_gid" "$shared" "$shared/logs"
+  chmod 770 "$shared" "$shared/logs"
+
+  service_zmx() {
+    setpriv --reuid="$service_uid" --regid="$shared_gid" --clear-groups \
+      env ZMX_DIR="$shared" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 "$ZMX" "$@"
+  }
+  client_zmx() {
+    setpriv --reuid="$client_uid" --regid="$shared_gid" --clear-groups \
+      env ZMX_DIR="$shared" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 "$ZMX" "$@"
+  }
+
+  service_zmx run service-session -d true
+  local i=0
+  while (( i < 50 )); do
+    client_zmx list --short 2>/dev/null | grep -qx service-session && break
+    sleep 0.1
+    (( i++ )) || true
+  done
+  run client_zmx list --short
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"service-session"* ]]
+
+  run client_zmx kill --force service-session
+  [ "$status" -eq 0 ]
+
+  setpriv --reuid="$client_uid" --regid="$shared_gid" --clear-groups \
+    sh -c 'mv "$1/logs" "$1/logs.owner" && mkdir "$1/logs" && chmod 770 "$1/logs"' sh "$shared"
+  run client_zmx list --short
   [ "$status" -ne 0 ]
-  [[ "$output" == *"ZMX_LOG_MODE"* ]]
+  [[ "$output" == *"WrongOwner"* ]]
+}
+
+@test "custom mode mismatches fail without mutation and print dynamic remediation" {
+  local wrong_dir="$BATS_TEST_TMPDIR/wrong-dir"
+  mkdir -p "$wrong_dir"
+  chmod 700 "$wrong_dir"
+  run env ZMX_DIR="$wrong_dir" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 "$ZMX" list --short
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"chmod 770"* ]]
+  [ "$(mode_of "$wrong_dir")" = 700 ]
+
+  local wrong_log="$BATS_TEST_TMPDIR/wrong-log"
+  mkdir -p "$wrong_log/logs"
+  chmod 770 "$wrong_log" "$wrong_log/logs"
+  printf old > "$wrong_log/logs/zmx.log"
+  chmod 600 "$wrong_log/logs/zmx.log"
+  run env ZMX_DIR="$wrong_log" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 "$ZMX" list --short
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"chmod 660"* ]]
+  [ "$(mode_of "$wrong_log/logs/zmx.log")" = 600 ]
+
+  local wrong_socket="$BATS_TEST_TMPDIR/wrong-socket"
+  env ZMX_DIR="$wrong_socket" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 \
+    "$ZMX" run socket-mismatch -d true
+  local i=0
+  while (( i < 50 )); do
+    [ -S "$wrong_socket/socket-mismatch" ] && break
+    sleep 0.1
+    (( i++ )) || true
+  done
+  [ -S "$wrong_socket/socket-mismatch" ]
+  chmod 600 "$wrong_socket/socket-mismatch"
+  run env ZMX_DIR="$wrong_socket" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 \
+    "$ZMX" run socket-mismatch -d true
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"chmod 660"* ]]
+  [ "$(mode_of "$wrong_socket/socket-mismatch")" = 600 ]
+  chmod 660 "$wrong_socket/socket-mismatch"
+  env ZMX_DIR="$wrong_socket" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 \
+    "$ZMX" kill --force socket-mismatch
+}
+
+@test "custom log mode survives rotation" {
+  local shared="$BATS_TEST_TMPDIR/rotate-shared"
+  env ZMX_DIR="$shared" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 "$ZMX" list --short
+  truncate -s 2097152 "$shared/logs/zmx.log"
+  chmod 660 "$shared/logs/zmx.log"
+
+  env ZMX_DIR="$shared" ZMX_DIR_MODE=770 ZMX_LOG_MODE=660 "$ZMX" list --short
+  [ "$(mode_of "$shared/logs/zmx.log")" = 660 ]
+  [ "$(wc -c < "$shared/logs/zmx.log")" -lt 2097152 ]
+}
+
+@test "malformed and out-of-range mode values fail clearly" {
+  run env ZMX_DIR_MODE=888 "$ZMX" list --short
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid ZMX_DIR_MODE"* ]]
+  [[ "$output" == *"octal permission mode"* ]]
+
+  run env ZMX_LOG_MODE=1000 "$ZMX" list --short
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid ZMX_LOG_MODE"* ]]
 }
 
 @test "insecure existing logs fail without mutation" {

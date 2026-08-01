@@ -136,16 +136,23 @@ contents. zmx prints a warning whenever `--log-input` is used. Existing log
 files may still contain raw input written by older zmx versions; upgrades do
 not delete or scrub historical logs automatically.
 
-The runtime and log directories must be owned by the effective user, must be
-real directories rather than symlinks, and must have mode `0700`. Logs and
-session sockets must likewise be owned by the effective user, non-symlinks of
-the expected type, and mode `0600`. zmx fails closed and prints remediation
-instead of changing insecure existing paths. `ZMX_DIR_MODE` and `ZMX_LOG_MODE`
-are no longer supported and must be unset. The internal session name `logs` is
-reserved. Individual `write` requests are limited to 128 KiB and are accepted
-into the PTY queue atomically. They require `base64`, `printf`, and `wc` in the
-session environment, and success is reported only after the remote shell
-verifies the resulting file size.
+The runtime and log directories must be real directories rather than symlinks
+and have the exact configured `ZMX_DIR_MODE` (octal, default `0700`). By default
+they must be owned by the effective user. An explicit group/world mode may
+instead authorize access to a foreign-owned directory; its owner and group then
+become the trust anchor for contained sockets or logs. Session socket mode is
+derived by removing execute bits from `ZMX_DIR_MODE` (`mode & 0666`), so `0700`
+produces `0600` sockets and `0770` produces `0660` sockets. Operational and
+per-session logs use `ZMX_LOG_MODE` (octal, default `0600`). zmx fails closed
+and prints dynamic remediation instead of changing insecure existing paths.
+Granting group permissions expands the set of trusted peers that can access
+zmx directories, sockets, or logs. Every zmx client and command in a deployment
+must use the same `ZMX_DIR_MODE` and `ZMX_LOG_MODE` so validation uses a
+consistent policy.
+The internal session name `logs` is reserved. Individual `write` requests are
+limited to 128 KiB and are accepted into the PTY queue atomically. They require
+`base64`, `printf`, and `wc` in the session environment, and success is reported
+only after the remote shell verifies the resulting file size.
 
 ## shell prompt
 
@@ -440,11 +447,27 @@ Each session gets its own unix socket file. The default location depends on your
 
 ## permissions
 
-Runtime and log directories are fixed at `0700`; log files and session sockets
-are fixed at `0600`. Existing paths with different ownership, mode, type, or
-symlink status are rejected with remediation instructions. Group-shared zmx
-directories and sockets are no longer supported. `ZMX_DIR_MODE` and
-`ZMX_LOG_MODE` must be unset.
+`ZMX_DIR_MODE` sets the exact mode for runtime and log directories (default
+`0700`). Socket mode is derived by removing execute bits (`ZMX_DIR_MODE & 0666`),
+so a group-shared `0770` directory produces `0660` sockets. `ZMX_LOG_MODE` sets
+the exact mode for operational and per-session log files (default `0600`); it
+does not control sockets. Values are parsed as octal permission modes and
+invalid or out-of-range values are rejected.
+
+Existing paths with the wrong anchored owner/group, mode, type, or symlink
+status are rejected with dynamic remediation instructions and are never
+modified automatically. Newly created zmx directories, logs, and sockets are
+set to their configured modes independently of the process umask; missing
+non-zmx ancestors are created as `0700` rather than inheriting the custom mode.
+
+For a system service, `ZMX_DIR_MODE=0770` and `ZMX_LOG_MODE=0660` let members of
+the directory's group use sessions created by the directory owner. The owner
+and group of each validated directory are the trust anchors for its sockets or
+logs, preventing another group member from substituting an object under their
+own UID. Run the service with the shared directory group as its effective
+(normally primary) group so newly created sockets and logs inherit that group.
+Group permissions expand the trusted peer set. All zmx clients and commands in
+one deployment must use the same `ZMX_DIR_MODE` and `ZMX_LOG_MODE`.
 
 ## debugging
 

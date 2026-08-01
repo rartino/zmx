@@ -1,4 +1,5 @@
 const std = @import("std");
+const Cfg = @import("cfg.zig");
 const ghostty_vt = @import("ghostty-vt");
 const input_classifier = @import("input.zig");
 const ipc = @import("ipc.zig");
@@ -35,6 +36,8 @@ pub fn get_session_entries(
     alloc: std.mem.Allocator,
     io: std.Io,
     socket_dir: []const u8,
+    socket_mode: std.posix.mode_t,
+    socket_owner: Cfg.Owner,
 ) !std.ArrayList(SessionEntry) {
     std.log.info("get session entries socket_dir={s}", .{socket_dir});
     var dir = try std.Io.Dir.openDirAbsolute(io, socket_dir, .{ .iterate = true });
@@ -48,7 +51,7 @@ pub fn get_session_entries(
         // directory entries are session candidates; explicit session access
         // still validates wrong-type and symlink paths fail-closed.
         if (entry.kind != .unix_domain_socket) continue;
-        const exists = socket.sessionExists(io, dir, socket_dir, entry.name) catch continue;
+        const exists = socket.sessionExists(io, dir, socket_dir, entry.name, socket_mode, socket_owner) catch continue;
         if (exists) {
             const name = try alloc.dupe(u8, entry.name);
             errdefer alloc.free(name);
@@ -59,7 +62,7 @@ pub fn get_session_entries(
             };
             defer alloc.free(socket_path);
 
-            const result = ipc.probeSession(alloc, socket_path) catch |err| {
+            const result = ipc.probeSession(alloc, socket_path, socket_mode, socket_owner) catch |err| {
                 try sessions.append(alloc, .{
                     .name = name,
                     .pid = null,
@@ -75,7 +78,7 @@ pub fn get_session_entries(
                 // daemon can miss the probe timeout; deleting its socket
                 // orphans it permanently.
                 if (err == error.ConnectionRefused) {
-                    socket.cleanupStaleSocket(io, dir, socket_dir, entry.name);
+                    socket.cleanupStaleSocket(io, dir, socket_dir, entry.name, socket_mode, socket_owner);
                 }
                 continue;
             };

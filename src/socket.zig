@@ -1,12 +1,11 @@
 const std = @import("std");
+const Cfg = @import("cfg.zig");
 const lib_posix = @import("posix.zig");
 const c = @cImport({
     @cInclude("fcntl.h");
     @cInclude("sys/stat.h");
     @cInclude("unistd.h");
 });
-
-const socket_mode_bits: std.posix.mode_t = 0o600;
 
 pub fn getSeshPrefix() []const u8 {
     return lib_posix.getenv("ZMX_SESSION_PREFIX") orelse "";
@@ -74,13 +73,13 @@ pub fn parseSessionArg(alloc: std.mem.Allocator, raw: []const u8) !SessionMatch 
     return .{ .name = name, .is_prefix = false };
 }
 
-pub fn sessionConnect(sesh: []const u8) !i32 {
+pub fn sessionConnect(sesh: []const u8, expected_mode: std.posix.mode_t, owner: Cfg.Owner) !i32 {
     const stat = statPath(sesh) catch |err| {
-        if (err != error.FileNotFound) reportInsecureSocket(sesh, err);
+        if (err != error.FileNotFound) reportInsecureSocket(sesh, expected_mode, owner, err);
         return err;
     };
-    validateSocketMetadata(stat, c.geteuid()) catch |err| {
-        reportInsecureSocket(sesh, err);
+    validateSocketMetadata(stat, owner, expected_mode) catch |err| {
+        reportInsecureSocket(sesh, expected_mode, owner, err);
         return error.InsecureSocket;
     };
 
@@ -91,15 +90,22 @@ pub fn sessionConnect(sesh: []const u8) !i32 {
     return socket_fd;
 }
 
-pub fn cleanupStaleSocket(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, session_name: []const u8) void {
+pub fn cleanupStaleSocket(
+    io: std.Io,
+    dir: std.Io.Dir,
+    dir_path: []const u8,
+    session_name: []const u8,
+    expected_mode: std.posix.mode_t,
+    owner: Cfg.Owner,
+) void {
     const stat = statAt(dir, session_name) catch |err| {
         if (err != error.FileNotFound) {
             std.log.warn("refusing stale socket cleanup session={s} err={s}", .{ session_name, @errorName(err) });
         }
         return;
     };
-    validateSocketMetadata(stat, c.geteuid()) catch |err| {
-        reportInsecureSocketEntry(dir_path, session_name, err);
+    validateSocketMetadata(stat, owner, expected_mode) catch |err| {
+        reportInsecureSocketEntry(dir_path, session_name, expected_mode, owner, err);
         return;
     };
 
@@ -109,7 +115,14 @@ pub fn cleanupStaleSocket(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, ses
     };
 }
 
-pub fn sessionExists(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, name: []const u8) !bool {
+pub fn sessionExists(
+    io: std.Io,
+    dir: std.Io.Dir,
+    dir_path: []const u8,
+    name: []const u8,
+    expected_mode: std.posix.mode_t,
+    owner: Cfg.Owner,
+) !bool {
     _ = dir.statFile(io, name, .{ .follow_symlinks = false }) catch |err| {
         switch (err) {
             error.FileNotFound => return false,
@@ -118,14 +131,14 @@ pub fn sessionExists(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, name: []
     };
 
     const stat = try statAt(dir, name);
-    validateSocketMetadata(stat, c.geteuid()) catch |err| {
-        reportInsecureSocketEntry(dir_path, name, err);
+    validateSocketMetadata(stat, owner, expected_mode) catch |err| {
+        reportInsecureSocketEntry(dir_path, name, expected_mode, owner, err);
         return error.InsecureSocket;
     };
     return true;
 }
 
-pub fn createSocket(sesh: []const u8) !lib_posix.socket_t {
+pub fn createSocket(sesh: []const u8, expected_mode: std.posix.mode_t, owner: Cfg.Owner) !lib_posix.socket_t {
     // AF.UNIX: Unix domain socket for local IPC with client processes
     // SOCK.STREAM: Reliable, bidirectional communication
     // SOCK.NONBLOCK: Set socket to non-blocking
@@ -142,18 +155,21 @@ pub fn createSocket(sesh: []const u8) !lib_posix.socket_t {
     }
 
     var unix_addr = try lib_posix.initUnix(sesh);
+    // Unix socket nodes are created from a 0777 base mode. Set the final mode
+    // as part of bind so a group-writable containing directory never exposes
+    // a pathname-based chmod race. createSocket runs before daemon threads or
+    // child processes exist, and restores the process umask immediately.
+    const old_umask = c.umask(@intCast((~expected_mode) & 0o777));
+    defer _ = c.umask(old_umask);
     try lib_posix.bind(fd, &unix_addr.any, unix_addr.getOsSockLen());
     bound = true;
 
-    if (c.chmod(path_buf[0..sesh.len :0], @intCast(socket_mode_bits)) != 0) {
-        return error.SocketModeSetFailed;
-    }
     const stat = statPath(sesh) catch |err| {
-        reportInsecureSocket(sesh, err);
+        reportInsecureSocket(sesh, expected_mode, owner, err);
         return error.InsecureSocket;
     };
-    validateSocketMetadata(stat, c.geteuid()) catch |err| {
-        reportInsecureSocket(sesh, err);
+    validateSocketMetadata(stat, owner, expected_mode) catch |err| {
+        reportInsecureSocket(sesh, expected_mode, owner, err);
         return error.InsecureSocket;
     };
     try lib_posix.listen(fd, 128);
@@ -187,23 +203,30 @@ fn statAt(dir: std.Io.Dir, name: []const u8) !c.struct_stat {
     return if (std.c.errno(rc) == .NOENT) error.FileNotFound else error.MetadataUnavailable;
 }
 
-fn validateSocketMetadata(stat: c.struct_stat, expected_uid: c.uid_t) !void {
+fn validateSocketMetadata(stat: c.struct_stat, owner: Cfg.Owner, expected_mode: std.posix.mode_t) !void {
     if (!c.S_ISSOCK(stat.st_mode)) return error.NotUnixSocket;
-    if (stat.st_uid != expected_uid) return error.WrongOwner;
-    if (stat.st_mode & 0o7777 != socket_mode_bits) return error.WrongMode;
+    if (stat.st_uid != owner.uid) return error.WrongOwner;
+    if (expected_mode & 0o070 != 0 and stat.st_gid != owner.gid) return error.WrongGroup;
+    if (stat.st_mode & 0o7777 != expected_mode) return error.WrongMode;
 }
 
-fn reportInsecureSocket(path: []const u8, err: anyerror) void {
+fn reportInsecureSocket(path: []const u8, expected_mode: std.posix.mode_t, owner: Cfg.Owner, err: anyerror) void {
     std.debug.print(
-        "error: insecure zmx socket \"{s}\" ({s}); remove a symlink/wrong-type path, or run: chmod 600 \"{s}\" && chown {d} \"{s}\"\n",
-        .{ path, @errorName(err), path, c.geteuid(), path },
+        "error: insecure zmx socket \"{s}\" ({s}); remove a symlink/wrong-type path, or run: chmod {o} \"{s}\" && chown {d}:{d} \"{s}\"\n",
+        .{ path, @errorName(err), expected_mode, path, owner.uid, owner.gid, path },
     );
 }
 
-fn reportInsecureSocketEntry(dir_path: []const u8, name: []const u8, err: anyerror) void {
+fn reportInsecureSocketEntry(
+    dir_path: []const u8,
+    name: []const u8,
+    expected_mode: std.posix.mode_t,
+    owner: Cfg.Owner,
+    err: anyerror,
+) void {
     std.debug.print(
-        "error: insecure zmx socket \"{s}/{s}\" ({s}); remove a symlink/wrong-type path, or run: chmod 600 \"{s}/{s}\" && chown {d} \"{s}/{s}\"\n",
-        .{ dir_path, name, @errorName(err), dir_path, name, c.geteuid(), dir_path, name },
+        "error: insecure zmx socket \"{s}/{s}\" ({s}); remove a symlink/wrong-type path, or run: chmod {o} \"{s}/{s}\" && chown {d}:{d} \"{s}/{s}\"\n",
+        .{ dir_path, name, @errorName(err), expected_mode, dir_path, name, owner.uid, owner.gid, dir_path, name },
     );
 }
 
@@ -295,17 +318,33 @@ test "canonical session validation rejects malicious and overlong switch targets
 
 test "socket metadata validation rejects foreign, wrong-mode, and wrong-type metadata" {
     var stat = std.mem.zeroes(c.struct_stat);
+    const owner: Cfg.Owner = .{ .uid = c.geteuid(), .gid = c.getegid() };
     stat.st_uid = c.geteuid();
+    stat.st_gid = c.getegid();
     stat.st_mode = c.S_IFSOCK | 0o600;
-    try validateSocketMetadata(stat, c.geteuid());
+    try validateSocketMetadata(stat, owner, 0o600);
 
     stat.st_uid = c.geteuid() + 1;
-    try std.testing.expectError(error.WrongOwner, validateSocketMetadata(stat, c.geteuid()));
+    try std.testing.expectError(error.WrongOwner, validateSocketMetadata(stat, owner, 0o600));
     stat.st_uid = c.geteuid();
+    stat.st_gid = c.getegid() + 1;
+    stat.st_mode = c.S_IFSOCK | 0o660;
+    try std.testing.expectError(error.WrongGroup, validateSocketMetadata(stat, owner, 0o660));
+    stat.st_gid = c.getegid();
     stat.st_mode = c.S_IFSOCK | 0o666;
-    try std.testing.expectError(error.WrongMode, validateSocketMetadata(stat, c.geteuid()));
+    try std.testing.expectError(error.WrongMode, validateSocketMetadata(stat, owner, 0o600));
     stat.st_mode = c.S_IFREG | 0o600;
-    try std.testing.expectError(error.NotUnixSocket, validateSocketMetadata(stat, c.geteuid()));
+    try std.testing.expectError(error.NotUnixSocket, validateSocketMetadata(stat, owner, 0o600));
+}
+
+test "socket metadata validation accepts the configured mode exactly" {
+    var stat = std.mem.zeroes(c.struct_stat);
+    const owner: Cfg.Owner = .{ .uid = c.geteuid(), .gid = c.getegid() };
+    stat.st_uid = c.geteuid();
+    stat.st_gid = c.getegid();
+    stat.st_mode = c.S_IFSOCK | 0o660;
+    try validateSocketMetadata(stat, owner, 0o660);
+    try std.testing.expectError(error.WrongMode, validateSocketMetadata(stat, owner, 0o600));
 }
 
 test "getSocketPath succeeds for paths within limit" {

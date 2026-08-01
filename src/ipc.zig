@@ -1,4 +1,5 @@
 const std = @import("std");
+const Cfg = @import("cfg.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
 const lib_posix = @import("posix.zig");
@@ -295,8 +296,8 @@ const ConnectError = error{
 
 /// Connect-only liveness check. Callers that don't read `Info` should use
 /// this (not `probeSession`) so they survive `Info` shape changes.
-pub fn connectSession(socket_path: []const u8) ConnectError!i32 {
-    return socket.sessionConnect(socket_path) catch |err| switch (err) {
+pub fn connectSession(socket_path: []const u8, socket_mode: std.posix.mode_t, owner: Cfg.Owner) ConnectError!i32 {
+    return socket.sessionConnect(socket_path, socket_mode, owner) catch |err| switch (err) {
         error.ConnectionRefused => return error.ConnectionRefused,
         else => return error.Unexpected,
     };
@@ -393,9 +394,11 @@ const SessionProbeResult = struct {
 pub fn probeSession(
     alloc: std.mem.Allocator,
     socket_path: []const u8,
+    socket_mode: std.posix.mode_t,
+    owner: Cfg.Owner,
 ) SessionProbeError!SessionProbeResult {
     const timeout_ms = 1000;
-    const fd = try connectSession(socket_path);
+    const fd = try connectSession(socket_path, socket_mode, owner);
     errdefer lib_posix.close(fd);
 
     send(fd, .Info, "") catch return error.Unexpected;
@@ -561,12 +564,14 @@ test "switch target carries policy and rejects malformed payloads" {
 pub fn roundTripForTag(
     alloc: std.mem.Allocator,
     socket_path: []const u8,
+    socket_mode: std.posix.mode_t,
+    owner: Cfg.Owner,
     request_tag: Tag,
     payload: []const u8,
     expected_tag: Tag,
 ) SessionProbeError![]u8 {
     const timeout_ms = 1000;
-    const fd = try connectSession(socket_path);
+    const fd = try connectSession(socket_path, socket_mode, owner);
     defer lib_posix.close(fd);
 
     send(fd, request_tag, payload) catch return error.Unexpected;
