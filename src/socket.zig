@@ -1,6 +1,11 @@
 const std = @import("std");
 const lib_posix = @import("posix.zig");
 
+// umask lives in sys/stat.h, which cross.zig does not pull in.
+const c = @cImport({
+    @cInclude("sys/stat.h");
+});
+
 pub fn getSeshPrefix() []const u8 {
     return lib_posix.getenv("ZMX_SESSION_PREFIX") orelse "";
 }
@@ -94,7 +99,7 @@ pub fn sessionExists(io: std.Io, dir: std.Io.Dir, name: []const u8) !bool {
     return true;
 }
 
-pub fn createSocket(sesh: []const u8) !lib_posix.socket_t {
+pub fn createSocket(sesh: []const u8, socket_mode: u32) !lib_posix.socket_t {
     // AF.UNIX: Unix domain socket for local IPC with client processes
     // SOCK.STREAM: Reliable, bidirectional communication
     // SOCK.NONBLOCK: Set socket to non-blocking
@@ -106,6 +111,12 @@ pub fn createSocket(sesh: []const u8) !lib_posix.socket_t {
     errdefer lib_posix.close(fd);
 
     var unix_addr = try lib_posix.initUnix(sesh);
+    // bind() takes no mode argument: the socket lands at 0777 & ~umask, which
+    // for the common umask of 022 is a world-connectable 0755. Anyone who can
+    // reach the socket owns the session -- they can inject input and read
+    // scrollback -- so narrow it via umask for the duration of the bind.
+    const old_umask = c.umask(@intCast((~socket_mode) & 0o777));
+    defer _ = c.umask(old_umask);
     try lib_posix.bind(fd, &unix_addr.any, unix_addr.getOsSockLen());
     try lib_posix.listen(fd, 128);
     return fd;
