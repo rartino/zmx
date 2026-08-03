@@ -107,10 +107,8 @@ pub fn createSocket(sesh: []const u8, socket_mode: u32) !lib_posix.socket_t {
     errdefer lib_posix.close(fd);
 
     var unix_addr = try lib_posix.initUnix(sesh);
-    // bind() creates the socket as 0777 & ~umask, so adjust umask here
-    const old_umask = cross.c.umask(@intCast((~socket_mode) & 0o777));
-    defer _ = cross.c.umask(old_umask);
     try lib_posix.bind(fd, &unix_addr.any, unix_addr.getOsSockLen());
+    _ = cross.c.fchmod(fd, @intCast(socket_mode));
     try lib_posix.listen(fd, 128);
     return fd;
 }
