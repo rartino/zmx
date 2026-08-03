@@ -2,6 +2,7 @@
 #
 #   make build           debug build (fast to compile, safety checks on)
 #   make build_release   ReleaseSafe -- what upstream ships; use this to install
+#   make tests           unit tests followed by all Bats integration tests
 #   make install         system-wide install (PREFIX, honours DESTDIR)
 #   make install_user    per-user install into XDG directories
 #
@@ -11,6 +12,7 @@
 
 # Zig 0.16.0 is required (see build.zig.zon). Override with: make ZIG=/path/to/zig
 ZIG ?= $(firstword $(wildcard ../.venv/lib/python*/site-packages/ziglang/zig) zig)
+BATS ?= bats
 
 PREFIX     ?= /usr/local
 DESTDIR    ?=
@@ -22,7 +24,7 @@ XDG_CONFIG_HOME ?= $(HOME)/.config
 # Not in the spec, but the de-facto standard location systemd and others use.
 XDG_BIN_HOME    ?= $(HOME)/.local/bin
 
-.PHONY: build build_release install install_user test check clean
+.PHONY: build build_release install install_user zig_tests tests check clean
 
 build:
 	$(ZIG) build
@@ -30,8 +32,11 @@ build:
 build_release:
 	$(ZIG) build -Doptimize=ReleaseSafe
 
-test:
+zig_tests:
 	$(ZIG) build test
+
+tests: zig_tests build
+	$(BATS) test/*.bats
 
 check:
 	$(ZIG) build check
